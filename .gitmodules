@@ -1,0 +1,6 @@
+[submodule "immer"]
+	path = immer
+	url = git@github.com:khiner/immer.git
+[submodule "lib/ut"]
+	path = lib/ut
+	url = git@github.com:boost-ext/ut.git
