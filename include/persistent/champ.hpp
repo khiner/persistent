@@ -216,13 +216,12 @@ public:
     champ erase(const K& k, const KeyOf& key_of, const KeyEq& key_eq) const {
         auto hash = Hash{}(k);
         auto res = do_sub(root_.get(), k, hash, 0, key_of, key_eq);
-        switch (res.kind) {
-        case sub_res::kind_t::nothing:
+        if (res.kind == sub_res::kind_t::nothing) {
             root_.get()->inc();
             return champ(root_.get(), size_);
-        case sub_res::kind_t::tree:
+        } else if (res.kind == sub_res::kind_t::tree) {
             return champ(res.tree, size_ - 1);
-        case sub_res::kind_t::singleton: {
+        } else {
             // Root collapsed to one item.  Re-wrap in a minimal inner node.
             T sv = std::move(*res.singleton_val);
             auto h = Hash{}(key_of(sv));
@@ -230,8 +229,6 @@ public:
             auto bit = bitmap_type{1u} << idx;
             return champ(node::make_inner_1(bit, std::move(sv)), size_ - 1);
         }
-        }
-        __builtin_unreachable();
     }
 
     // -----------------------------------------------------------------------
@@ -389,8 +386,18 @@ private:
             const auto* ca = a->collision();
             const auto* cb = b->collision();
             if (ca->count != cb->count) return false;
-            for (count_t i = 0; i < ca->count; ++i)
-                if (!Equal{}(ca->items()[i], cb->items()[i])) return false;
+            const T* ia = ca->items();
+            const T* ib = cb->items();
+            // Collision items are stored in insertion order, which can differ
+            // between two structurally equivalent nodes.  Use a set-membership
+            // check so order does not matter.
+            for (count_t i = 0; i < ca->count; ++i) {
+                bool found = false;
+                for (count_t j = 0; j < cb->count; ++j) {
+                    if (Equal{}(ia[i], ib[j])) { found = true; break; }
+                }
+                if (!found) return false;
+            }
             return true;
         }
         const auto* ia = a->inner();

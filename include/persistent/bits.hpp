@@ -4,6 +4,7 @@
 // Matches immer's detail/hamts/bits.hpp logic.
 
 #include <cstdint>
+#include <bitset>
 #include <climits>
 #include <type_traits>
 
@@ -46,10 +47,34 @@ inline constexpr shift_t max_shift =
     static_cast<shift_t>(max_depth<hash_t, B>) * B;
 
 // Portable popcount (count of set bits).
-inline count_t popcount(std::uint8_t  x) noexcept { return static_cast<count_t>(__builtin_popcount(x));  }
-inline count_t popcount(std::uint16_t x) noexcept { return static_cast<count_t>(__builtin_popcount(x));  }
-inline count_t popcount(std::uint32_t x) noexcept { return static_cast<count_t>(__builtin_popcount(x));  }
-inline count_t popcount(std::uint64_t x) noexcept { return static_cast<count_t>(__builtin_popcountll(x)); }
+inline count_t popcount(std::uint8_t  x) noexcept {
+#if defined(__GNUC__) || defined(__clang__)
+    return static_cast<count_t>(__builtin_popcount(x));
+#else
+    return static_cast<count_t>(std::bitset<8>(x).count());
+#endif
+}
+inline count_t popcount(std::uint16_t x) noexcept {
+#if defined(__GNUC__) || defined(__clang__)
+    return static_cast<count_t>(__builtin_popcount(x));
+#else
+    return static_cast<count_t>(std::bitset<16>(x).count());
+#endif
+}
+inline count_t popcount(std::uint32_t x) noexcept {
+#if defined(__GNUC__) || defined(__clang__)
+    return static_cast<count_t>(__builtin_popcount(x));
+#else
+    return static_cast<count_t>(std::bitset<32>(x).count());
+#endif
+}
+inline count_t popcount(std::uint64_t x) noexcept {
+#if defined(__GNUC__) || defined(__clang__)
+    return static_cast<count_t>(__builtin_popcountll(x));
+#else
+    return static_cast<count_t>(std::bitset<64>(x).count());
+#endif
+}
 
 } // namespace detail
 } // namespace persistent
