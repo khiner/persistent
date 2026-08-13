@@ -13,6 +13,7 @@
 #pragma clang diagnostic pop
 
 #include <random>
+#include <utility>
 
 using namespace boost::ut;
 
@@ -84,5 +85,38 @@ int main() {
         }
         expect(ours.Size == uint64_t{theirs.size()});
         for (const auto &[key, value] : theirs) expect((hamt::Get(ours, key) == std::optional{value}) >> fatal) << "key" << key;
+    };
+
+    "in-place reuse"_test = [] {
+        // Updating through an rvalue hands sole ownership over, so uniquely owned nodes are rewritten
+        // in place instead of copied. A snapshot taken part way through gives every node it can reach
+        // a second name, and must be left untouched by every update that follows.
+        std::mt19937_64 rng{7};
+        std::uniform_int_distribution<uint64_t> key_dist{0, 1 << 10};
+        hamt::Map ours{};
+        immer::map<uint64_t, uint64_t> theirs;
+        for (uint64_t i = 0; i < 2'000; ++i) {
+            const auto key = key_dist(rng);
+            ours = hamt::Set(std::move(ours), key, i);
+            theirs = theirs.set(key, i);
+        }
+        const auto ours_snapshot = ours;
+        const auto theirs_snapshot = theirs;
+
+        for (uint64_t i = 2'000; i < 20'000; ++i) {
+            const auto key = key_dist(rng);
+            if (rng() % 3 == 0) {
+                ours = hamt::Erase(std::move(ours), key);
+                theirs = theirs.erase(key);
+            } else {
+                ours = hamt::Set(std::move(ours), key, i);
+                theirs = theirs.set(key, i);
+            }
+        }
+        expect(ours.Size == uint64_t{theirs.size()});
+        for (const auto &[key, value] : theirs) expect((hamt::Get(ours, key) == std::optional{value}) >> fatal) << "key" << key;
+
+        expect(ours_snapshot.Size == uint64_t{theirs_snapshot.size()});
+        for (const auto &[key, value] : theirs_snapshot) expect((hamt::Get(ours_snapshot, key) == std::optional{value}) >> fatal) << "snapshot key" << key;
     };
 }
