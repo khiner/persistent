@@ -13,6 +13,9 @@ struct Entry {
 // Persistent map from 64-bit keys to 64-bit values, backed by a hash array mapped trie.
 // Every operation returns a new map and leaves its input intact, with the two sharing all unchanged structure.
 // A map holds a reference to the structure it shares, and shared structure lives until the last map naming it dies.
+//
+// Single threaded, and not per map but altogether: reference counts are not atomic, and the nodes come
+// from one global free list, so two threads whose maps share no structure at all still race.
 struct Map {
     const Node *Root{};
     uint64_t Size{};
@@ -41,8 +44,18 @@ bool operator==(const Map &a, const Map &b);
 // A standing check on the representation invariant, meant for tests: linear in the size of the map.
 bool Check(const Map &m);
 
+// How many nodes the library is holding, which is a check that maps give their structure back.
+// Only an audit build (-DHAMT_AUDIT) keeps the count, and that build also returns freed nodes to the
+// allocator rather than to the free list, so a sanitizer can see a use after free. Anywhere else this
+// is empty, which says the count is not being kept rather than that it is zero.
+std::optional<uint64_t> LiveNodes();
+
 // Depth-first walk yielding every entry once. The order is unspecified, but it follows from the trie
 // shape alone, so equal maps iterate identically.
+//
+// An iterator names the map it walks, exactly as another map would, and that is what keeps it valid.
+// An update rewrites nodes in place only when the map it was handed holds the sole reference to them,
+// so the iterator's reference is the second name that sends the update down the copying path instead.
 struct Iterator {
     // A level consumes at least five hash bits, so a path is at most this long.
     static constexpr uint32_t MaxDepth = 13;
@@ -51,8 +64,9 @@ struct Iterator {
         const Node *const *Child, *const *ChildEnd;
     };
 
+    Map Source; // The reference the walk holds, released when the iterator dies.
     const Entry *Cur{}, *End{}; // The entries of the node being yielded from. `Cur` is null at the end.
-    Frame Stack[MaxDepth];
+    Frame Stack[MaxDepth]{};
     uint32_t Depth{};
 
     const Entry &operator*() const { return *Cur; }

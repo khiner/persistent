@@ -86,17 +86,33 @@ constexpr uint32_t Words(Bitmap datamap, Bitmap nodemap) {
 // dozen sizes at a rate malloc is not built for, and the node a path copy frees is nearly always the
 // size the next one wants. immer does the same thing for the same reason.
 // The cost is that the memory stays ours until exit. The lists hold every node the process has freed.
+//
+// It costs the sanitizers too, which is what the audit build is for. A freed node stays reachable and
+// gets handed out again, so a leak is indistinguishable from a live node and a use after free reads as
+// an ordinary access. A double release is not caught where it happens either: the link below overwrites
+// `Refs`, so the decrement lands in half a pointer, and what surfaces is a node handed out at the wrong
+// size somewhere else entirely. Under -DHAMT_AUDIT nodes go straight back to the allocator and the live
+// ones are counted, which puts all three back within reach of a test and of asan, at the site.
+#ifdef HAMT_AUDIT
+uint64_t Live = 0;
+#else
 constexpr uint32_t SizeClasses = Words(~Bitmap{0}, 0) + 1; // All entries, the widest a node gets.
 const Node *Freed[SizeClasses]{};
+#endif
 
 void Release(const Node *n) {
     if (--n->Refs) return;
     const auto *const *cs = Children(n);
     for (uint32_t i = 0, nc = ChildCount(*n); i < nc; ++i) Release(cs[i]);
+#ifdef HAMT_AUDIT
+    --Live;
+    std::free(Mutable(n));
+#else
     auto &list = Freed[Words(n->Datamap, n->Nodemap)];
     // The header is dead now, so the link to the next free node lives in it.
     *reinterpret_cast<const Node **>(Mutable(n)) = list;
     list = n;
+#endif
 }
 
 void CopyEntries(Entry *dst, const Entry *src, uint32_t n) { std::memcpy(dst, src, n * sizeof(Entry)); }
@@ -111,14 +127,19 @@ void CloneChildren(const Node **dst, const Node *const *src, uint32_t n) {
 // The returned node carries the one reference its caller is expected to hand on.
 Node *Alloc(Bitmap datamap, Bitmap nodemap) {
     const auto words = Words(datamap, nodemap);
-    auto &list = Freed[words];
     Node *n;
+#ifdef HAMT_AUDIT
+    ++Live;
+    n = static_cast<Node *>(std::malloc(words * 8));
+#else
+    auto &list = Freed[words];
     if (list) {
         n = Mutable(list);
         list = *reinterpret_cast<const Node *const *>(n);
     } else {
         n = static_cast<Node *>(std::malloc(words * 8));
     }
+#endif
     n->Refs = 1;
     n->Children = std::popcount(nodemap);
     n->Datamap = datamap;
@@ -320,6 +341,9 @@ bool SameNodes(const Node *a, const Node *b) {
 // and that no node is empty or collapsible -- the two ways shape could stop being a function of contents.
 bool CheckNode(const Node *n, uint32_t shift, uint64_t prefix, uint64_t &count) {
     if (n->Datamap & n->Nodemap) return false; // A slot holds an entry or a child, never both.
+    // Checked before anything reads an entry, because the cached count is what places the entries:
+    // a stale one moves the whole entry array and everything below would be looking at the wrong bytes.
+    if (n->Children != uint32_t(std::popcount(n->Nodemap))) return false;
     const auto dc = DataCount(*n), nc = ChildCount(*n);
     if (dc + nc == 0) return false; // Empty nodes are never built, not even at the root.
     if (shift > 0 && nc == 0 && dc == 1) return false; // A lone entry belongs inlined in the parent.
@@ -412,8 +436,10 @@ std::optional<uint64_t> Get(const Map &m, uint64_t key) {
 }
 
 bool operator==(const Map &a, const Map &b) {
-    if (a.Root == b.Root) return true;
-    // Only an empty map has a null root, and that case just went by, so both roots are real here.
+    if (a.Root == b.Root) return true; // Two empty maps, or two that share a root outright.
+    if (!a.Root || !b.Root) return false; // Only an empty map has a null root, so one of them is empty.
+    // The size test is an early out and nothing more. Equal contents in a canonical trie means equal
+    // structure, so `SameNodes` would reject a size mismatch on its own, just after walking for it.
     return a.Size == b.Size && SameNodes(a.Root, b.Root);
 }
 
@@ -421,6 +447,14 @@ bool Check(const Map &m) {
     if (!m.Root) return m.Size == 0;
     uint64_t count = 0;
     return CheckNode(m.Root, 0, 0, count) && count == m.Size;
+}
+
+std::optional<uint64_t> LiveNodes() {
+#ifdef HAMT_AUDIT
+    return Live;
+#else
+    return {};
+#endif
 }
 
 void Iterator::Advance() {
@@ -437,7 +471,7 @@ void Iterator::Advance() {
 }
 
 Iterator begin(const Map &m) {
-    Iterator it{};
+    Iterator it{m}; // The copy is the reference that holds the structure below still.
     if (!m.Root) return it;
     Descend(it, m.Root);
     if (it.Cur == it.End) it.Advance(); // A root holding only children has nothing to yield yet.

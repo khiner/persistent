@@ -1,5 +1,11 @@
 // Aspirational tests for the from-scratch HAMT. The oracle is immer::map (the reference implementation
 // in /immer), driven through the same operation sequence and required to agree on every lookup.
+//
+// Built twice, and both are worth running:
+//   cmake --build build --target HamtTest HamtAuditTest
+//   ./build/tests/HamtTest && ./build/tests/HamtAuditTest
+// HamtAuditTest links the library without its node free list, which is the only build where the
+// reclamation check below can see anything, and the only one a sanitizer can say much about.
 
 #include "Hamt.h"
 
@@ -213,5 +219,44 @@ int main() {
         expect(Iterates(ours, theirs));
         expect(hamt::Check(ours_snapshot));
         expect(Iterates(ours_snapshot, theirs_snapshot));
+    };
+
+    "iterating pins the structure"_test = [] {
+        // An iterator names the map, so an update handed that same map is not its sole owner and has
+        // to copy. Without that, the update would rewrite the very nodes being walked, in place.
+        constexpr uint64_t N = 200;
+        hamt::Map m{};
+        for (uint64_t i = 0; i < N; ++i) m = hamt::Set(std::move(m), i * 3, i);
+
+        uint64_t seen = 0;
+        for (auto it = hamt::begin(m); it != hamt::end(m); ++it) {
+            expect(it->Value == it->Key / 3) << "the walk saw a rebound entry"; // Not the value below.
+            ++seen;
+            m = hamt::Set(std::move(m), it->Key, it->Value + 1'000); // Rebinds a key under the walk.
+        }
+        expect(seen == N);
+        for (uint64_t i = 0; i < N; ++i) expect(hamt::Get(m, i * 3) == std::optional{i + 1'000});
+    };
+
+    "reclamation"_test = [] {
+        // Nodes are reference counted, and every other test here would pass just the same if a count
+        // leaked or went one too far. Only the audit build can see it -- elsewhere the free list keeps
+        // a freed node reachable and hands it out again.
+        constexpr uint64_t N = 5'000;
+        {
+            std::mt19937_64 rng{3};
+            std::vector<uint64_t> keys;
+            hamt::Map m{};
+            for (uint64_t i = 0; i < N; ++i) {
+                keys.push_back(rng());
+                m = hamt::Set(std::move(m), keys.back(), i); // Sole ownership, so paths are rewritten in place.
+            }
+            const auto shared = m; // A second name, so every erase below copies its path instead.
+            for (const auto key : keys) m = hamt::Erase(m, key);
+            expect(m.Size == 0_u64);
+            expect(shared.Size == N);
+        }
+        // Every map this suite built has died by now, so the library should be holding nothing at all.
+        if (const auto live = hamt::LiveNodes()) expect(*live == 0_u64);
     };
 }

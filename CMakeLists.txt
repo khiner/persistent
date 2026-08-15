@@ -22,5 +22,13 @@ target_include_directories(hamt PUBLIC src)
 target_compile_definitions(hamt PRIVATE HAMT_BITS=${HAMT_BITS})
 target_compile_options(hamt PRIVATE -Wall -Wextra)
 
+# The same library with the node free list taken out, so freed nodes go back to the allocator and the
+# live ones are counted. Nothing links this but the tests: it is the only build in which a leak, a
+# double release, or a use after free is visible at all -- see the free list in src/Hamt.cpp.
+add_library(hamt_audit src/Hamt.cpp)
+target_include_directories(hamt_audit PUBLIC src)
+target_compile_definitions(hamt_audit PRIVATE HAMT_BITS=${HAMT_BITS} HAMT_AUDIT)
+target_compile_options(hamt_audit PRIVATE -Wall -Wextra)
+
 add_subdirectory(tests)
 add_subdirectory(bench)
