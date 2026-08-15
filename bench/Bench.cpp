@@ -14,6 +14,7 @@
 
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <random>
 #include <utility>
 #include <vector>
@@ -95,8 +96,13 @@ void Run(uint64_t n) {
 }
 } // namespace
 
-int main() {
+int main(int argc, char **argv) {
     std::printf("ns/op, lower is better. Last column is our margin over immer.\n");
-    for (const uint64_t n : {uint64_t{1'000}, uint64_t{100'000}, uint64_t{1'000'000}}) Run(n);
+    // Sizes on the command line, for sweeping a curve finer than the three defaults resolve.
+    if (argc > 1) {
+        for (int i = 1; i < argc; ++i) Run(std::strtoull(argv[i], nullptr, 10));
+    } else {
+        for (const uint64_t n : {uint64_t{1'000}, uint64_t{100'000}, uint64_t{1'000'000}}) Run(n);
+    }
     std::printf("\n(checksum %llu)\n", (unsigned long long)Sink);
 }

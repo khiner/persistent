@@ -18,45 +18,51 @@ constexpr uint32_t Bits = HAMT_BITS;
 static_assert(Bits == 5 || Bits == 6, "A slot map has to be exactly one machine word wide");
 
 using Bitmap = std::conditional_t<Bits == 6, uint64_t, uint32_t>;
-constexpr Bitmap Mask = (Bitmap{1} << Bits) - 1;
 
-// splitmix64's finalizer. It is a bijection on uint64, so distinct keys never share a hash,
-// and the levels between them consume all 64 hash bits -- any two keys separate before the trie
-// bottoms out. That is why there are no collision nodes here.
-// Mixing is not what buys that (identity would too). It buys a shape that does not depend on
-// the key distribution, so pointer-like keys with zeroed low bits stay shallow.
-constexpr uint64_t Hash(uint64_t x) {
-    x += 0x9e3779b97f4a7c15ull;
-    x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ull;
-    x = (x ^ (x >> 27)) * 0x94d049bb133111ebull;
-    return x ^ (x >> 31);
-}
+// Fibonacci hashing: one multiply by an odd constant, read from the top down. Odd makes it a
+// bijection on uint64, so distinct keys never share a hash, and the levels between them consume all
+// 64 hash bits -- any two keys separate before the trie bottoms out. That is why there are no
+// collision nodes here.
+// Mixing is not what buys that (identity would too). It buys a shape that does not depend on the key
+// distribution, so pointer-like keys with zeroed low bits stay shallow. Reading from the top is what
+// makes one multiply enough for that: a product's high bits depend on every key bit below them, so
+// the levels near the root -- the only ones a real map reaches -- are the well mixed ones. A
+// splitmix64 finalizer mixes the low bits just as well, but it is five more operations on a
+// dependency chain that lookup latency is already made of.
+constexpr uint64_t Hash(uint64_t x) { return x * 0x9e3779b97f4a7c15ull; }
 
-constexpr uint32_t Idx(uint64_t hash, uint32_t shift) { return static_cast<uint32_t>((hash >> shift) & Mask); }
+// The next `Bits` of the hash below the `shift` bits the path here has already consumed.
+constexpr uint32_t Idx(uint64_t hash, uint32_t shift) { return static_cast<uint32_t>((hash << shift) >> (64 - Bits)); }
 } // namespace
 
 static_assert(Iterator::MaxDepth >= (64 + Bits - 1) / Bits, "The iterator stack has to hold a whole path");
 
 // A CHAMP node. `Datamap` marks the slots holding an inline entry, `Nodemap` the slots holding a
-// child, and no slot is in both. Entries and children trail the header in that order, each packed
+// child, and no slot is in both. Children and entries trail the header in that order, each packed
 // to the set bits of its map, so a slot's position is the popcount of the lower bits.
 // `Refs` counts the maps and parent nodes naming this one. It is not atomic: sharing a map across
 // threads is not supported, and rpds measures the atomic version at up to 2x on this traffic.
 struct alignas(8) Node {
     mutable uint32_t Refs;
+    // popcount(Nodemap), which is where the entries start. Cached because the entries are behind the
+    // children, so every walk that ends in one would otherwise pay a popcount to find them, and
+    // because it costs nothing: the alignment the bitmaps need leaves this word spare at both widths.
+    uint32_t Children;
     Bitmap Datamap, Nodemap;
 };
 
 namespace {
 uint32_t DataCount(const Node &n) { return std::popcount(n.Datamap); }
-uint32_t ChildCount(const Node &n) { return std::popcount(n.Nodemap); }
+uint32_t ChildCount(const Node &n) { return n.Children; }
 uint32_t DataOffset(const Node &n, Bitmap bit) { return std::popcount(n.Datamap & (bit - 1)); }
 uint32_t ChildOffset(const Node &n, Bitmap bit) { return std::popcount(n.Nodemap & (bit - 1)); }
 
-Entry *Entries(Node *n) { return reinterpret_cast<Entry *>(n + 1); }
-const Entry *Entries(const Node *n) { return reinterpret_cast<const Entry *>(n + 1); }
-const Node **Children(Node *n) { return reinterpret_cast<const Node **>(Entries(n) + DataCount(*n)); }
-const Node *const *Children(const Node *n) { return reinterpret_cast<const Node *const *>(Entries(n) + DataCount(*n)); }
+// Children come first so that descending a level costs one popcount and no arithmetic on the base.
+// That is the step a lookup repeats, against a single entry access at the end of it.
+const Node **Children(Node *n) { return reinterpret_cast<const Node **>(n + 1); }
+const Node *const *Children(const Node *n) { return reinterpret_cast<const Node *const *>(n + 1); }
+Entry *Entries(Node *n) { return reinterpret_cast<Entry *>(Children(n) + ChildCount(*n)); }
+const Entry *Entries(const Node *n) { return reinterpret_cast<const Entry *>(Children(n) + ChildCount(*n)); }
 
 // Nodes live in malloc'd storage, never in read-only memory, so writing through this is well formed.
 // Only reachable when the node is uniquely owned, which is what makes the write unobservable.
@@ -64,11 +70,27 @@ Node *Mutable(const Node *n) { return const_cast<Node *>(n); }
 
 void Retain(const Node *n) { ++n->Refs; }
 
+// A node's size, in the 8-byte words it is always a whole number of. Recoverable from the bitmaps
+// alone, which is what lets a node be returned to the right free list without storing its size.
+constexpr uint32_t Words(Bitmap datamap, Bitmap nodemap) {
+    return uint32_t(sizeof(Node) / 8) + std::popcount(datamap) * uint32_t(sizeof(Entry) / 8) + std::popcount(nodemap);
+}
+
+// Freed nodes go to a list per size, rather than back to the allocator. A trie churns nodes of a few
+// dozen sizes at a rate malloc is not built for, and the node a path copy frees is nearly always the
+// size the next one wants. immer does the same thing for the same reason.
+// The cost is that the memory stays ours until exit. The lists hold every node the process has freed.
+constexpr uint32_t SizeClasses = Words(~Bitmap{0}, 0) + 1; // All entries, the widest a node gets.
+const Node *Freed[SizeClasses]{};
+
 void Release(const Node *n) {
     if (--n->Refs) return;
     const auto *const *cs = Children(n);
     for (uint32_t i = 0, nc = ChildCount(*n); i < nc; ++i) Release(cs[i]);
-    std::free(const_cast<Node *>(n));
+    auto &list = Freed[Words(n->Datamap, n->Nodemap)];
+    // The header is dead now, so the link to the next free node lives in it.
+    *reinterpret_cast<const Node **>(Mutable(n)) = list;
+    list = n;
 }
 
 void CopyEntries(Entry *dst, const Entry *src, uint32_t n) { std::memcpy(dst, src, n * sizeof(Entry)); }
@@ -82,8 +104,17 @@ void CloneChildren(const Node **dst, const Node *const *src, uint32_t n) {
 
 // The returned node carries the one reference its caller is expected to hand on.
 Node *Alloc(Bitmap datamap, Bitmap nodemap) {
-    auto *n = static_cast<Node *>(std::malloc(sizeof(Node) + std::popcount(datamap) * sizeof(Entry) + std::popcount(nodemap) * sizeof(const Node *)));
+    const auto words = Words(datamap, nodemap);
+    auto &list = Freed[words];
+    Node *n;
+    if (list) {
+        n = Mutable(list);
+        list = *reinterpret_cast<const Node *const *>(n);
+    } else {
+        n = static_cast<Node *>(std::malloc(words * 8));
+    }
     n->Refs = 1;
+    n->Children = std::popcount(nodemap);
     n->Datamap = datamap;
     n->Nodemap = nodemap;
     return n;
@@ -278,7 +309,7 @@ bool SameNodes(const Node *a, const Node *b) {
     return true;
 }
 
-// `prefix` is the hash bits the path down to `n` has already fixed, and `count`
+// `prefix` is the leading `shift` hash bits the path down to `n` has already fixed, and `count`
 // accumulates the entries found. Confirms every entry and child sits in the slot its hash selects,
 // and that no node is empty or collapsible -- the two ways shape could stop being a function of contents.
 bool CheckNode(const Node *n, uint32_t shift, uint64_t prefix, uint64_t &count) {
@@ -286,18 +317,17 @@ bool CheckNode(const Node *n, uint32_t shift, uint64_t prefix, uint64_t &count) 
     const auto dc = DataCount(*n), nc = ChildCount(*n);
     if (dc + nc == 0) return false; // Empty nodes are never built, not even at the root.
     if (shift > 0 && nc == 0 && dc == 1) return false; // A lone entry belongs inlined in the parent.
-    const uint64_t prefix_mask = (uint64_t{1} << shift) - 1;
     count += dc;
     auto dm = n->Datamap;
     for (uint32_t i = 0; dm; dm &= dm - 1, ++i) {
         const auto hash = Hash(Entries(n)[i].Key);
-        if ((hash & prefix_mask) != prefix) return false;
+        if (shift > 0 && hash >> (64 - shift) != prefix) return false;
         if (Idx(hash, shift) != uint32_t(std::countr_zero(dm))) return false;
     }
     auto nm = n->Nodemap;
     for (uint32_t i = 0; nm; nm &= nm - 1, ++i) {
         const auto slot = uint64_t(std::countr_zero(nm));
-        if (!CheckNode(Children(n)[i], shift + Bits, prefix | (slot << shift), count)) return false;
+        if (!CheckNode(Children(n)[i], shift + Bits, (prefix << Bits) | slot, count)) return false;
     }
     return true;
 }

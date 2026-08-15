@@ -14,7 +14,8 @@ set(CMAKE_INTERPROCEDURAL_OPTIMIZATION ON)
 
 add_subdirectory(lib)
 
-set(HAMT_BITS 5 CACHE STRING "Trie branching factor exponent: 5 for 32 slots per node, 6 for 64.")
+# 6 by default because the sweep says so -- see the first open question in docs/Literature.md.
+set(HAMT_BITS 6 CACHE STRING "Trie branching factor exponent: 5 for 32 slots per node, 6 for 64.")
 
 add_library(hamt src/Hamt.cpp)
 target_include_directories(hamt PUBLIC src)
