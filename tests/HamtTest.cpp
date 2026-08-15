@@ -118,10 +118,10 @@ int main() {
     };
 
     "full depth"_test = [] {
-        // Keys whose hashes come out consecutive, so they agree on every level but the last and drive
-        // the trie to its full depth -- a path random keys never take. The step is the multiplicative
-        // inverse of the hash constant, so stepping the key by it steps the hash by one.
-        constexpr uint64_t Step = 0xf1de83e19937733dull;
+        // Keys whose hashes differ only in the top four bits, so they agree on every level but the
+        // last and drive the trie to its full depth -- a path random keys never take. The step is
+        // what the hash's inverse maps 1 << 60 to, so stepping the key by it steps the hash by that.
+        constexpr uint64_t Step = 0x1000100000000000ull;
         constexpr uint64_t N = 8;
         hamt::Map m{};
         Bindings expected;

@@ -34,7 +34,7 @@ Read from the `immer/` submodule, since it is our oracle.
 - Two node kinds (`immer/detail/hamts/node.hpp`): `inner_t { nodemap, datamap, values*, children[] }` and `collision_t { count, values[] }`.
 - **Divergence from the paper:** immer puts values in a separately heap-allocated `values_t` block with its own refcount and `ownee`, not inline in the node. Every data hit costs an extra pointer chase and every node costs two allocations. It is a deliberate trade for transience — the values block can be shared and mutated independently — and it is our clearest performance opening.
 - Canonicalization on erase is real (`do_sub`: singleton collapse via `copy_inner_replace_inline`, collision 2 to 1, root special-cased at `shift == 0`), and immer ships `check_champ()` to assert it. Bit-exact parity is therefore a well-defined target, testable structurally and not just through `Get`.
-- **No hash mixing.** immer feeds `Hash{}(key)` straight into the trie, and `std::hash<uint64_t>` is the identity. Trie shape is therefore fully determined by the raw low bits of the key, which is fine for sequential keys and degenerate for pointer-like ones. We are not bound by this (see §7).
+- **No hash mixing.** immer feeds `Hash{}(key)` straight into the trie, and `std::hash<uint64_t>` is the identity. Trie shape is therefore fully determined by the raw low bits of the key. Measured (§10.2), this is a better bet than it looks: it is *optimal* for a dense key set, since a counter gives a perfectly full trie with every key at the same depth, and modest strides cost only the few levels their zeroed low bits waste. It takes a large alignment before it really hurts. We are not bound by it (see §7), but beating it takes a hash that preserves density rather than one that scrambles.
 - **Diff already exists** in the oracle: `champ::diff` plus `diff_data_node` / `diff_node_data` / `diff_data_data` / `diff_collisions`, short-circuiting on pointer equality, so O(|diff|) when `b` derives from `a`. Same algorithm as the immutable-js [efficient trie diff PR](https://github.com/immutable-js/immutable-js/pull/953). This is the baseline our diff addon has to beat.
 
 ## 3. Implementations worth reading
@@ -117,8 +117,50 @@ Those three are where a 2026 CHAMP can plausibly beat a 2015 one.
 
 Design positions, in descending confidence:
 
-1. **Values inline in the node**, paper-faithful, against immer's separate values block: one allocation and one indirection fewer per node. This was the main performance thesis before and it survives unchanged.
-2. **Mix the hash.** A splitmix64 finalizer on the key. Makes trie depth independent of key distribution, kills immer's degenerate pointer-key case, and pushes collision nodes off the reachable path. Small fixed cost on every operation. This is the clearest thing parity was blocking.
+1. **Values inline in the node**, paper-faithful, against immer's separate values block: one allocation and one indirection fewer per node. This was the main performance thesis before, and it is now measured. It holds everywhere except one shape, and the exception is worth stating precisely because it is a property of the thesis and not a bug.
+
+   Lookup cost oscillates with `n`, on random keys. (Everything in this entry was measured with random keys and a multiplicative hash. A dense key set does not oscillate at all -- see position 2 -- and any bijection scatters random keys the same way, so the shape of the finding stands.) Terminal occupancy is `n / B^depth`, so it cycles through 1 to `2^B` for every factor of `2^B` in `n`, and the margin against immer cycles with it. Both libraries oscillate and the phase differs because the branching factor does, which is why B=5 and B=6 come out almost exactly complementary. Lookup hit, ns/op, min of three runs:
+
+   | n | 1e3 | 2e3 | 4e3 | 8e3 | 1.6e4 | 3.2e4 | 6.4e4 | 1.28e5 | 2.56e5 | 5.12e5 | 1e6 |
+   |---|---|---|---|---|---|---|---|---|---|---|---|
+   | B=5 | 6.8 | 4.7 | 4.5 | 6.1 | 9.3 | 9.6 | 7.3 | 7.4 | 9.9 | 14.0 | 16.5 |
+   | **B=6** | **4.0** | 6.3 | 6.9 | **4.4** | **3.9** | **4.6** | 6.8 | 10.1 | 11.0 | **8.8** | **10.4** |
+   | immer | 5.6 | 4.3 | 4.3 | 5.7 | 6.9 | 7.9 | 6.7 | 7.2 | 9.2 | 13.1 | 17.9 |
+
+   B=6 wins 6 of 11 sizes by 23–43% and loses 5 by 1–60%, for a geometric mean 11% ahead. B=5 is flatter and worse, winning 1 of 11. Where one is bad the other is good, so a branching factor picked per map would be near-uniformly ahead — but B is baked into the shape of the trie, and a map cannot change it without being rebuilt.
+
+   **What the oscillation actually is.** Not node size, and not the cache: padding `Entry` from 16 bytes to 32, doubling the byte spread of every node and the footprint of the whole map, changes lookup by under 2% at every size. What it is instead is the spread of *depths* a walk can end at. Occupancy near `2^B` is exactly the point where a level is half resolved, so terminal depth is split most evenly between two levels, and the walk's trip count stops being predictable. Timing the same lookups grouped by terminal depth instead of shuffled is worth 44–69%:
+
+   | n | depth mix | shuffled | grouped |
+   |---|---|---|---|
+   | 1e3 | 80% / 20% | 8.6 | 3.8 |
+   | 2e3 | 62% / 38% | 11.2 | 3.5 |
+   | 4e3 | 38% / 61% | 9.1 | 2.9 |
+   | 8e3 | 15% / 83% | 4.3 | 2.4 |
+
+   Grouping buys locality as well as predictability, so that number is an upper bound on the branch effect alone. But the ranking is unambiguous, and it lands on the one thing a canonical trie cannot negotiate: CHAMP puts every entry at the shallowest level where its hash prefix is unique, so terminal depth is a distribution and not a constant. immer inherits it too.
+
+   Things that do not fix it, all measured: prefetching the entry region a level ahead is 3–6% *worse*; the extra popcount is not the cost, since the gap survives ARMv9.4 scalar popcount (`+cssc`, worth ~20% to us and ~24% to immer, and machine-specific besides); B=4 is worse than both 5 and 6 at every size tried; and **hoisting each child's datamap into its parent** — which does remove one dependent load, and does buy 12% on lookup at 1e5 — costs 8 bytes per child and comes out a net loss, 7% off build and erase at 1e5 and 16–20% off at 1e6. Splitting keys from values would halve the byte spread, which the padding result says is not what costs.
+2. **Fold the hash, do not scramble it.** Two xor-shifts, `x ^= x >> 32; x ^= x >> 16`, read bottom up. This position started as "mix the hash, a splitmix64 finalizer", and measuring it is what changed it.
+
+   The original argument was right about the hazard and wrong about the remedy. The hazard is real: keys that arrive aligned — heap addresses, anything scaled by a power of two — have low bits that never vary, and an identity hash spends whole levels resolving nothing. What the argument missed is that scrambling has a cost, and the cost is bigger than the hazard. A dense key set is the *best* case a trie has: every node full, every key at the same depth, neighbouring keys in the same node. Counters, object ids and table row numbers hand that over for free, and any good mixer destroys it. immer, hashing with the identity, keeps it.
+
+   A fold keeps both. Each xor-shift is a bijection that maps `[0, 2^k)` into itself, so a dense key set stays dense, while the folding still fills in low bits that never vary from bits that do. Measured at a million entries against immer, going from the multiply to the fold:
+
+   | | lookup hit | build move | iterate |
+   |---|---|---|---|
+   | sequential | -77% → **-21%** | -105% → **-42%** | -133% → **-62%** |
+   | pointer, 16-byte stride | -112% → **-7%** | -82% → **+34%** | -127% → **+21%**|
+   | pointer, 64-byte stride | -63% → **-30%** | -30% → **+28%** | +52% → **+59%** |
+   | random | +42% → +38% | +42% → +43% | +14% → +17% |
+
+   Random keys are indifferent, as they must be — any bijection scatters them equally. Everything else improves, several from a rout to a win.
+
+   What is left is that a dense counter is *exactly* the key set an identity hash is optimal for, and we are still 21% behind on lookup there. Density also costs on the write side, since it puts every key at the maximum depth and so makes every path copy full length: build-copy on sequential keys is the one row the fold made worse.
+
+   **This is the row of the benchmark that was missing.** Until now every measurement used uniformly random 64-bit keys, which is the one distribution that cannot tell an identity hash from a good one. `HamtBench all` now sweeps a counter and two heap-address strides as well.
+
+   Where the sequential deficit actually comes from is worth naming, because it is not the hash. A million dense keys occupy 20 bits. Five divides 20 and six does not, so immer's last level is full and ours holds four of its sixty-four slots — 262144 terminal nodes of four entries each where immer has 32768 of thirty. Eight times the nodes to allocate while building and eight times the pointers to chase while iterating, which is exactly the shape of what is left: build -46%, iterate -67%, lookup only -21%. It is the occupancy story again, in the dense regime, and like that one it is a property of `B` against `n` rather than something to fix.
 3. **Refcount-1 in-place mutation** rather than an explicit transient type — Perceus's insight applied dynamically. Non-atomic refcount by default.
 4. **Diff: pointer-equality short-circuit first.** Per-node incremental multiset hash only if measurement justifies the extra word — but it is the single change that would make our diff strictly better than immer's rather than equal to it.
 5. **`B` is now an open experiment, not an inherited constant.** See below.
@@ -139,6 +181,7 @@ Roughly in order of how much they matter.
   So B=6 is the read-side default. A write-dominated workload at a million entries or more is the case for configuring B=5 back, and that is what the knob is still there for. The remaining B=6 cost is a 24-byte node header against B=5's 16, since two 64-bit bitmaps no longer pack alongside the refcount — see the node-header-packing question below.
 - **Key/value layout inside the node: interleaved pairs or split key and value arrays?** Popcount indexing means we never scan, so the win is not lookup — it is iteration over keys alone and not dragging large values through cache. Modest, measurable, and cheap to try once values are inline.
 - **Small-map flat representation** (Erlang's ≤32 sorted arrays) — now permitted. But CHAMP already handles small maps as a single root node with inline values, and Erlang's win comes partly from BEAM's heavier HAMT. Measure before building the second code path.
+- ~~**Bucketed leaves**~~ — **answered: no.** Letting a slot hold up to K entries in a small leaf instead of forcing a child, splitting only above K, is canonical (the rule is a function of contents) and it looks compelling on paper: the level at which a key resolves drops from "where my prefix is unique" to "where my subtrie has at most K keys", which is half a level shallower and far more concentrated. That is the wrong metric. A leaf is itself a node, so reaching an entry inside one costs the hop the shallower resolution saved, and only a subtrie of exactly one key is inline in its parent. Counted as node visits, K=8 against K=1 over ten sizes from 1e3 to 1e6: 3.39 against 3.39 at 1.28e5, 3.98 against 4.04 at 1e6, and inside a percent everywhere else. Concentration barely moves either. It buys nothing and costs a second node kind, a linear scan, and a merge rule on erase. The same arithmetic applies to any bucketing scheme, Erlang's flatmap included, whenever the bucket is reached through a pointer rather than stored inline.
 - **Dense array node above some occupancy** (Clojure's `ArrayNode`) — now permitted, and it does not break canonicality if the promotion threshold is a pure function of occupancy. Trades memory for a skipped popcount. Low expected value against CHAMP's compact array, but cheap to test.
 - **Cache the hash in the leaf, or recompute?** Doubles entry size for a uint64→uint64 map, so probably no here, but it is the right answer for expensive-to-hash keys and it makes collision comparison trivial (see scala-dev#525).
 - **Node header packing.** With immer's field order no longer binding: `datamap` and `nodemap` at B=5 are two 32-bit words, so they pack into one 64-bit word, leaving refcount and kind to a second. At B=6, now the default, they are two full words and the refcount pads the header out to 24 bytes. Getting that back means stealing refcount bits from a bitmap, which is the only place left to take them from.

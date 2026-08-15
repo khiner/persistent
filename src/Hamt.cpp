@@ -18,21 +18,27 @@ constexpr uint32_t Bits = HAMT_BITS;
 static_assert(Bits == 5 || Bits == 6, "A slot map has to be exactly one machine word wide");
 
 using Bitmap = std::conditional_t<Bits == 6, uint64_t, uint32_t>;
+constexpr Bitmap Mask = (Bitmap{1} << Bits) - 1;
 
-// Fibonacci hashing: one multiply by an odd constant, read from the top down. Odd makes it a
-// bijection on uint64, so distinct keys never share a hash, and the levels between them consume all
-// 64 hash bits -- any two keys separate before the trie bottoms out. That is why there are no
-// collision nodes here.
-// Mixing is not what buys that (identity would too). It buys a shape that does not depend on the key
-// distribution, so pointer-like keys with zeroed low bits stay shallow. Reading from the top is what
-// makes one multiply enough for that: a product's high bits depend on every key bit below them, so
-// the levels near the root -- the only ones a real map reaches -- are the well mixed ones. A
-// splitmix64 finalizer mixes the low bits just as well, but it is five more operations on a
-// dependency chain that lookup latency is already made of.
-constexpr uint64_t Hash(uint64_t x) { return x * 0x9e3779b97f4a7c15ull; }
+// Fold the high bits down twice, then read the trie from the bottom up. Each fold is a bijection on
+// uint64, so distinct keys never share a hash, and the levels between them consume all 64 hash bits
+// -- any two keys separate before the trie bottoms out. That is why there are no collision nodes here.
+//
+// What the folding is for is the two ways a real key set is not random. A fold maps [0, 2^k) into
+// itself, so a dense key set stays dense, and dense is the best case a trie has: every node full,
+// every key at the same depth, neighbouring keys in the same node. A counter or a table of object
+// ids hands us that for free, and multiplying would throw it away. Meanwhile a key set that arrives
+// aligned -- heap addresses, anything scaled by a power of two -- has low bits that never vary, and
+// reading those first would spend whole levels resolving nothing. Folding fills them in from bits
+// that do vary. An identity hash keeps the first property and loses the second.
+constexpr uint64_t Hash(uint64_t x) {
+    x ^= x >> 32;
+    x ^= x >> 16;
+    return x;
+}
 
-// The next `Bits` of the hash below the `shift` bits the path here has already consumed.
-constexpr uint32_t Idx(uint64_t hash, uint32_t shift) { return static_cast<uint32_t>((hash << shift) >> (64 - Bits)); }
+// The next `Bits` of the hash above the `shift` bits the path here has already consumed.
+constexpr uint32_t Idx(uint64_t hash, uint32_t shift) { return static_cast<uint32_t>((hash >> shift) & Mask); }
 } // namespace
 
 static_assert(Iterator::MaxDepth >= (64 + Bits - 1) / Bits, "The iterator stack has to hold a whole path");
@@ -309,7 +315,7 @@ bool SameNodes(const Node *a, const Node *b) {
     return true;
 }
 
-// `prefix` is the leading `shift` hash bits the path down to `n` has already fixed, and `count`
+// `prefix` is the low `shift` hash bits the path down to `n` has already fixed, and `count`
 // accumulates the entries found. Confirms every entry and child sits in the slot its hash selects,
 // and that no node is empty or collapsible -- the two ways shape could stop being a function of contents.
 bool CheckNode(const Node *n, uint32_t shift, uint64_t prefix, uint64_t &count) {
@@ -321,13 +327,13 @@ bool CheckNode(const Node *n, uint32_t shift, uint64_t prefix, uint64_t &count) 
     auto dm = n->Datamap;
     for (uint32_t i = 0; dm; dm &= dm - 1, ++i) {
         const auto hash = Hash(Entries(n)[i].Key);
-        if (shift > 0 && hash >> (64 - shift) != prefix) return false;
+        if ((hash & ((uint64_t{1} << shift) - 1)) != prefix) return false;
         if (Idx(hash, shift) != uint32_t(std::countr_zero(dm))) return false;
     }
     auto nm = n->Nodemap;
     for (uint32_t i = 0; nm; nm &= nm - 1, ++i) {
         const auto slot = uint64_t(std::countr_zero(nm));
-        if (!CheckNode(Children(n)[i], shift + Bits, (prefix << Bits) | slot, count)) return false;
+        if (!CheckNode(Children(n)[i], shift + Bits, prefix | (slot << shift), count)) return false;
     }
     return true;
 }

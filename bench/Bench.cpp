@@ -1,6 +1,6 @@
 // Standing benchmark against immer, the reference implementation.
 //   cmake --build build --target HamtBench && ./build/bench/HamtBench
-// Sweep the branching factor by configuring a second build dir with -DHAMT_BITS=6.
+// Sweep the branching factor by configuring a second build dir with -DHAMT_BITS=5.
 
 #include "Hamt.h"
 
@@ -12,10 +12,12 @@
 #include <immer/map_transient.hpp>
 #pragma clang diagnostic pop
 
+#include <cctype>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <random>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -39,10 +41,27 @@ template<typename F> double Time(uint64_t ops, F &&f) {
     return best / double(ops);
 }
 
-std::vector<uint64_t> RandomKeys(uint64_t n, uint64_t seed) {
-    std::mt19937_64 rng{seed};
+// How the keys are shaped matters as much as how many there are. immer feeds the key straight to the
+// trie, so a dense key set gives it a dense trie and every key the same depth, while a key set with
+// zeroed low bits wastes whole levels. We mix, so all four of these look the same to us.
+enum class Pattern { Random,
+                     Sequential,
+                     Pointer16,
+                     Pointer64 };
+constexpr const char *PatternNames[]{"random", "sequential", "pointer x16", "pointer x64"};
+
+// `run` separates the present keys from the absent ones without changing the shape of either.
+std::vector<uint64_t> Keys(uint64_t n, Pattern p, uint64_t run) {
     std::vector<uint64_t> keys(n);
-    for (auto &key : keys) key = rng();
+    if (p == Pattern::Random) {
+        std::mt19937_64 rng{run};
+        for (auto &key : keys) key = rng();
+        return keys;
+    }
+    // A counter, and two rates of heap address, one object per 16 or 64 bytes.
+    const uint64_t base = p == Pattern::Sequential ? 0 : 0x600000000000ull, stride = p == Pattern::Pointer16 ? 16 : p == Pattern::Pointer64 ? 64 :
+                                                                                                                                              1;
+    for (uint64_t i = 0; i < n; ++i) keys[i] = base + (run * n + i) * stride;
     return keys;
 }
 
@@ -62,12 +81,12 @@ void Row(const char *name, double ours, double immer) {
     std::printf("  %-14s %8.1f %8.1f   %+6.1f%%\n", name, ours, immer, 100 * (immer - ours) / immer);
 }
 
-void Run(uint64_t n) {
-    const auto keys = RandomKeys(n, 1), absent = RandomKeys(n, 2);
+void Run(uint64_t n, Pattern pattern) {
+    const auto keys = Keys(n, pattern, 0), absent = Keys(n, pattern, 1);
     const auto ours = Built(keys);
     const auto theirs = ImmerBuilt(keys);
 
-    std::printf("\nn = %llu%s\n  %-14s %8s %8s %9s\n", (unsigned long long)n, "", "", "ours", "immer", "ours vs");
+    std::printf("\nn = %llu, %s keys\n  %-14s %8s %8s %9s\n", (unsigned long long)n, PatternNames[int(pattern)], "", "ours", "immer", "ours vs");
 
     Row("build copy",
         Time(n, [&] { hamt::Map m{}; for (uint64_t i = 0; i < n; ++i) m = hamt::Set(m, keys[i], i); return m.Size; }),
@@ -98,11 +117,33 @@ void Run(uint64_t n) {
 
 int main(int argc, char **argv) {
     std::printf("ns/op, lower is better. Last column is our margin over immer.\n");
-    // Sizes on the command line, for sweeping a curve finer than the three defaults resolve.
-    if (argc > 1) {
-        for (int i = 1; i < argc; ++i) Run(std::strtoull(argv[i], nullptr, 10));
-    } else {
-        for (const uint64_t n : {uint64_t{1'000}, uint64_t{100'000}, uint64_t{1'000'000}}) Run(n);
+    // An optional leading key pattern, then sizes, for sweeping a curve finer than the defaults
+    // resolve or for driving the shapes a counter and a heap allocator actually produce.
+    //   HamtBench                     the three default sizes on random keys
+    //   HamtBench sequential 1000000  one size, one pattern
+    //   HamtBench all 100000          every pattern at one size
+    int arg = 1;
+    std::vector<Pattern> patterns{Pattern::Random};
+    if (argc > 1 && !std::isdigit(static_cast<unsigned char>(argv[1][0]))) {
+        ++arg;
+        const std::string_view name{argv[1]};
+        if (name == "all") patterns = {Pattern::Random, Pattern::Sequential, Pattern::Pointer16, Pattern::Pointer64};
+        else {
+            patterns.clear();
+            for (int i = 0; i < 4; ++i)
+                if (name == PatternNames[i] || (name == "pointer" && i >= 2)) patterns.push_back(Pattern(i));
+            if (patterns.empty()) {
+                std::printf("unknown key pattern '%s'\n", argv[1]);
+                return 1;
+            }
+        }
+    }
+    for (const auto pattern : patterns) {
+        if (arg < argc) {
+            for (int i = arg; i < argc; ++i) Run(std::strtoull(argv[i], nullptr, 10), pattern);
+        } else {
+            for (const uint64_t n : {uint64_t{1'000}, uint64_t{100'000}, uint64_t{1'000'000}}) Run(n, pattern);
+        }
     }
     std::printf("\n(checksum %llu)\n", (unsigned long long)Sink);
 }
