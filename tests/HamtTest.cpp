@@ -11,7 +11,7 @@
 
 #include <boost/ut.hpp>
 
-// Included with plain -I rather than -isystem (see tests/CMakeLists.txt), so silence immer's warnings here.
+// Included with plain -I rather than -isystem (see the top-level CMakeLists.txt), so silence immer's warnings here.
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wunused-parameter"
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
@@ -47,6 +47,9 @@ Bindings Sorted(const immer::map<uint64_t, uint64_t> &m) {
 
 // The map iterates exactly the bindings `expected` holds.
 template<typename T> bool Iterates(const hamt::Map &m, const T &expected) { return Sorted(m) == Sorted(expected); }
+
+// `key` is bound, and to `value`.
+bool Holds(const hamt::Map &m, uint64_t key, uint64_t value) { return hamt::Get(m, key) == std::optional{value}; }
 } // namespace
 
 using namespace boost::ut;
@@ -64,16 +67,16 @@ int main() {
         m = hamt::Set(m, 2, 200);
         m = hamt::Set(m, 3, 300);
         expect(m.Size == 3_u64);
-        expect(hamt::Get(m, 1) == std::optional<uint64_t>{100});
-        expect(hamt::Get(m, 2) == std::optional<uint64_t>{200});
-        expect(hamt::Get(m, 3) == std::optional<uint64_t>{300});
+        expect(Holds(m, 1, 100));
+        expect(Holds(m, 2, 200));
+        expect(Holds(m, 3, 300));
         expect(!hamt::Get(m, 4).has_value());
     };
 
     "overwrite"_test = [] {
         const auto m = hamt::Set(hamt::Set({}, 1, 100), 1, 101);
         expect(m.Size == 1_u64);
-        expect(hamt::Get(m, 1) == std::optional<uint64_t>{101});
+        expect(Holds(m, 1, 101));
     };
 
     "persistence"_test = [] {
@@ -82,19 +85,19 @@ int main() {
         expect(before.Size == 1_u64);
         expect(!hamt::Get(before, 2).has_value());
         expect(after.Size == 2_u64);
-        expect(hamt::Get(after, 1) == std::optional<uint64_t>{100});
+        expect(Holds(after, 1, 100));
 
         const auto erased = hamt::Erase(after, 1);
         expect(erased.Size == 1_u64);
         expect(!hamt::Get(erased, 1).has_value());
-        expect(hamt::Get(after, 1) == std::optional<uint64_t>{100}); // The erase left `after` intact.
+        expect(Holds(after, 1, 100)); // The erase left `after` intact.
     };
 
     "erase misses"_test = [] {
         const auto m = hamt::Set({}, 1, 100);
         const auto erased = hamt::Erase(m, 2);
         expect(erased.Size == 1_u64);
-        expect(hamt::Get(erased, 1) == std::optional<uint64_t>{100});
+        expect(Holds(erased, 1, 100));
     };
 
     "iterate"_test = [] {
@@ -138,7 +141,7 @@ int main() {
         }
         expect(m.Size == N);
         expect(Iterates(m, expected));
-        for (uint64_t i = 0; i < N; ++i) expect(hamt::Get(m, i * Step) == std::optional{i});
+        for (uint64_t i = 0; i < N; ++i) expect(Holds(m, i * Step, i));
 
         // Erasing back down unwinds the whole chain, one collapsed level at a time.
         for (uint64_t i = 0; i < N; ++i) {
@@ -235,7 +238,7 @@ int main() {
             m = hamt::Set(std::move(m), it->Key, it->Value + 1'000); // Rebinds a key under the walk.
         }
         expect(seen == N);
-        for (uint64_t i = 0; i < N; ++i) expect(hamt::Get(m, i * 3) == std::optional{i + 1'000});
+        for (uint64_t i = 0; i < N; ++i) expect(Holds(m, i * 3, i + 1'000));
     };
 
     "reclamation"_test = [] {

@@ -115,13 +115,27 @@ void Release(const Node *n) {
 #endif
 }
 
-void CopyEntries(Entry *dst, const Entry *src, uint32_t n) { std::memcpy(dst, src, n * sizeof(Entry)); }
+void Copy(Entry *dst, const Entry *src, uint32_t n) { std::memcpy(dst, src, n * sizeof(Entry)); }
 
-// Children are copied by reference, so every clone claims one. A child left out of a clone keeps
-// the reference its old parent holds, and a freshly built child is assigned rather than cloned.
-void CloneChildren(const Node **dst, const Node *const *src, uint32_t n) {
+// Children are copied by reference, so every copy claims one. A child left out of a copy keeps
+// the reference its old parent holds, and a freshly built child is assigned rather than copied.
+void Copy(const Node **dst, const Node *const *src, uint32_t n) {
     std::memcpy(static_cast<void *>(dst), static_cast<const void *>(src), n * sizeof(const Node *));
     for (uint32_t i = 0; i < n; ++i) Retain(dst[i]);
+}
+
+// One edit to a node's entry or child array as the node is copied: at `Off`, drop what was there
+// when `Del` and write `Ins` when it is given. Both together is a replacement, neither a plain copy.
+template<typename T> struct Edit {
+    uint32_t Off{};
+    bool Del{};
+    const T *Ins{};
+};
+
+template<typename T> void Splice(T *dst, const T *src, uint32_t n, Edit<T> e) {
+    Copy(dst, src, e.Off);
+    if (e.Ins) dst[e.Off] = *e.Ins; // Not copied, so no reference is claimed: it arrives owning one.
+    Copy(dst + e.Off + (e.Ins != nullptr), src + e.Off + e.Del, n - e.Off - e.Del);
 }
 
 // The returned node carries the one reference its caller is expected to hand on.
@@ -147,74 +161,55 @@ Node *Alloc(Bitmap datamap, Bitmap nodemap) {
     return n;
 }
 
-Node *CopyOf(const Node *n) {
-    auto *c = Alloc(n->Datamap, n->Nodemap);
-    CopyEntries(Entries(c), Entries(n), DataCount(*n));
-    CloneChildren(Children(c), Children(n), ChildCount(*n));
+// A fresh node holding `n`'s contents under the given bitmaps, with one edit to each of its arrays.
+// Every way the trie rewrites a node is one of these, which is why they all read as one line below.
+//
+// Inlined on purpose, and measurably: every caller passes a literal `Edit`, so inlining folds away
+// the tests on `Del` and `Ins` and leaves each caller the straight-line copy it would have spelled
+// out by hand. Left to itself the compiler emits one shared out-of-line copy instead, which costs
+// about 1% across the benchmark -- most of it on the path-copying rows, which is where this lives.
+[[gnu::always_inline]] Node *Rebuilt(const Node *n, Bitmap datamap, Bitmap nodemap, Edit<Entry> de, Edit<const Node *> ce) {
+    auto *c = Alloc(datamap, nodemap);
+    Splice(Entries(c), Entries(n), DataCount(*n), de);
+    Splice(Children(c), Children(n), ChildCount(*n), ce);
     return c;
 }
 
-Node *WithChildReplaced(const Node *n, uint32_t off, const Node *child) {
-    const auto nc = ChildCount(*n);
-    auto *c = Alloc(n->Datamap, n->Nodemap);
-    CopyEntries(Entries(c), Entries(n), DataCount(*n));
-    auto **cs = Children(c);
-    CloneChildren(cs, Children(n), off);
-    cs[off] = child;
-    CloneChildren(cs + off + 1, Children(n) + off + 1, nc - off - 1);
-    return c;
-}
-
-Node *WithEntryInserted(const Node *n, Bitmap bit, Entry e) {
-    const auto dc = DataCount(*n), off = DataOffset(*n, bit);
-    auto *c = Alloc(n->Datamap | bit, n->Nodemap);
-    auto *es = Entries(c);
-    CopyEntries(es, Entries(n), off);
-    es[off] = e;
-    CopyEntries(es + off + 1, Entries(n) + off, dc - off);
-    CloneChildren(Children(c), Children(n), ChildCount(*n));
-    return c;
-}
-
-Node *WithEntryRemoved(const Node *n, Bitmap bit) {
-    const auto dc = DataCount(*n), off = DataOffset(*n, bit);
-    auto *c = Alloc(n->Datamap ^ bit, n->Nodemap);
-    auto *es = Entries(c);
-    CopyEntries(es, Entries(n), off);
-    CopyEntries(es + off, Entries(n) + off + 1, dc - off - 1);
-    CloneChildren(Children(c), Children(n), ChildCount(*n));
-    return c;
-}
+Node *WithEntryInserted(const Node *n, Bitmap bit, Entry e) { return Rebuilt(n, n->Datamap | bit, n->Nodemap, {DataOffset(*n, bit), false, &e}, {}); }
+Node *WithEntryRemoved(const Node *n, Bitmap bit) { return Rebuilt(n, n->Datamap ^ bit, n->Nodemap, {DataOffset(*n, bit), true}, {}); }
 
 // The slot moves from the entry side to the child side, for when two keys collide on it.
 Node *WithEntryPromoted(const Node *n, Bitmap bit, const Node *child) {
-    const auto dc = DataCount(*n), nc = ChildCount(*n);
-    const auto doff = DataOffset(*n, bit), coff = ChildOffset(*n, bit);
-    auto *c = Alloc(n->Datamap ^ bit, n->Nodemap | bit);
-    auto *es = Entries(c);
-    CopyEntries(es, Entries(n), doff);
-    CopyEntries(es + doff, Entries(n) + doff + 1, dc - doff - 1);
-    auto **cs = Children(c);
-    CloneChildren(cs, Children(n), coff);
-    cs[coff] = child;
-    CloneChildren(cs + coff + 1, Children(n) + coff, nc - coff);
-    return c;
+    return Rebuilt(n, n->Datamap ^ bit, n->Nodemap | bit, {DataOffset(*n, bit), true}, {ChildOffset(*n, bit), false, &child});
 }
 
 // The reverse: a child that has collapsed to its last entry folds back into the entry side.
 // This is what keeps the trie canonical, so shape is a function of contents alone.
 Node *WithChildInlined(const Node *n, Bitmap bit, Entry e) {
-    const auto dc = DataCount(*n), nc = ChildCount(*n);
-    const auto doff = DataOffset(*n, bit), coff = ChildOffset(*n, bit);
-    auto *c = Alloc(n->Datamap | bit, n->Nodemap ^ bit);
-    auto *es = Entries(c);
-    CopyEntries(es, Entries(n), doff);
-    es[doff] = e;
-    CopyEntries(es + doff + 1, Entries(n) + doff, dc - doff);
-    auto **cs = Children(c);
-    CloneChildren(cs, Children(n), coff);
-    CloneChildren(cs + coff, Children(n) + coff + 1, nc - coff - 1);
-    return c;
+    return Rebuilt(n, n->Datamap | bit, n->Nodemap ^ bit, {DataOffset(*n, bit), false, &e}, {ChildOffset(*n, bit), true});
+}
+
+// The two in-place rewrites, each paired with the copy it falls back to. An owned node is named
+// exactly once, so no other map can see the write, and returning `n` itself says that is what
+// happened -- which is what lets the whole path above it stay untouched too.
+//
+// Both are inlined for the same reason `Rebuilt` is, and `WithChild` more urgently: an update calls
+// it once per level, so left out of line it puts a call in the middle of every path copy.
+
+// `n` with the entry in slot `off` rebound to `e`. A rebind leaves the shape alone.
+[[gnu::always_inline]] const Node *WithEntry(const Node *n, uint32_t off, Entry e, bool owned) {
+    if (!owned) return Rebuilt(n, n->Datamap, n->Nodemap, {off, true, &e}, {});
+    Entries(Mutable(n))[off] = e;
+    return n;
+}
+
+// `n` with the child in slot `off`, currently `old`, replaced by `updated`.
+[[gnu::always_inline]] const Node *WithChild(const Node *n, uint32_t off, const Node *old, const Node *updated, bool owned) {
+    if (updated == old) return n;
+    if (!owned) return Rebuilt(n, n->Datamap, n->Nodemap, {}, {off, true, &updated});
+    Children(Mutable(n))[off] = updated; // The slot is ours to repoint, and `old` loses its last name here.
+    Release(old);
+    return n;
 }
 
 // Two entries whose hashes agree up to `shift`, as a subtrie: one node per level they still share.
@@ -239,35 +234,20 @@ struct SetResult {
 };
 
 // `owned` means every node from the root down to `n` is named exactly once, so no other map can
-// see `n` and rewriting it in place is unobservable. Returning `n` itself says that is what happened,
-// which lets the whole path above it stay untouched.
+// see `n` and rewriting it in place is unobservable. See `WithEntry` and `WithChild` above.
 SetResult DoSet(const Node *n, Entry e, uint64_t hash, uint32_t shift, bool owned) {
     const Bitmap bit = Bitmap{1} << Idx(hash, shift);
     if (n->Datamap & bit) {
         const auto off = DataOffset(*n, bit);
         const auto old = Entries(n)[off];
-        if (old.Key == e.Key) { // A rebind leaves the shape alone, so an owned node takes it directly.
-            if (owned) {
-                Entries(Mutable(n))[off] = e;
-                return {n, false};
-            }
-            auto *c = CopyOf(n);
-            Entries(c)[off] = e;
-            return {c, false};
-        }
+        if (old.Key == e.Key) return {WithEntry(n, off, e, owned), false};
         return {WithEntryPromoted(n, bit, Merged(old, Hash(old.Key), e, hash, shift + Bits)), true};
     }
     if (n->Nodemap & bit) {
         const auto off = ChildOffset(*n, bit);
         const auto *child = Children(n)[off];
         const auto r = DoSet(child, e, hash, shift + Bits, owned && child->Refs == 1);
-        if (r.Root == child) return {n, r.Added};
-        if (owned) { // The slot is ours to repoint, and the old child loses its last name here.
-            Children(Mutable(n))[off] = r.Root;
-            Release(child);
-            return {n, r.Added};
-        }
-        return {WithChildReplaced(n, off, r.Root), r.Added};
+        return {WithChild(n, off, child, r.Root, owned), r.Added};
     }
     return {WithEntryInserted(n, bit, e), true};
 }
@@ -291,30 +271,22 @@ EraseResult DoErase(const Node *n, uint64_t key, uint64_t hash, uint32_t shift, 
         const auto off = DataOffset(*n, bit);
         if (Entries(n)[off].Key != key) return {EraseStatus::NotFound};
         const auto dc = DataCount(*n);
+        // A node with a child, or with entries to spare, has enough left to stand on its own.
         if (n->Nodemap || dc > 2) return {EraseStatus::Replaced, WithEntryRemoved(n, bit)};
-        if (dc == 2) {
-            const auto lone = Entries(n)[off ^ 1];
-            if (shift > 0) return {EraseStatus::Singleton, nullptr, lone};
-            auto *c = Alloc(n->Datamap ^ bit, 0); // Nothing above the root to absorb it.
-            Entries(c)[0] = lone;
-            return {EraseStatus::Replaced, c};
+        // Otherwise a lone survivor is all that would be left, and that belongs inlined in the parent.
+        if (shift > 0) {
+            assert(dc == 2); // Below the root, one entry and no children would have collapsed.
+            return {EraseStatus::Singleton, nullptr, Entries(n)[off ^ 1]};
         }
-        assert(shift == 0); // Below the root, one entry and no children would have collapsed.
-        return {EraseStatus::Empty};
+        // The root has no parent to hand it to, so it keeps the survivor -- or, with none, the map is gone.
+        if (dc == 1) return {EraseStatus::Empty};
+        return {EraseStatus::Replaced, WithEntryRemoved(n, bit)};
     }
     if (!(n->Nodemap & bit)) return {EraseStatus::NotFound};
     const auto off = ChildOffset(*n, bit);
     const auto *child = Children(n)[off];
     const auto r = DoErase(child, key, hash, shift + Bits, owned && child->Refs == 1);
-    if (r.Status == EraseStatus::Replaced) {
-        if (r.Replacement == child) return {EraseStatus::Replaced, n};
-        if (owned) {
-            Children(Mutable(n))[off] = r.Replacement;
-            Release(child);
-            return {EraseStatus::Replaced, n};
-        }
-        return {EraseStatus::Replaced, WithChildReplaced(n, off, r.Replacement)};
-    }
+    if (r.Status == EraseStatus::Replaced) return {EraseStatus::Replaced, WithChild(n, off, child, r.Replacement, owned)};
     if (r.Status == EraseStatus::Singleton) {
         // Keep passing it up while this node has nothing of its own to hold it.
         if (!n->Datamap && ChildCount(*n) == 1 && shift > 0) return r;
@@ -374,10 +346,7 @@ void Descend(Iterator &it, const Node *n) {
 Map::Map(const Map &o) : Root(o.Root), Size(o.Size) {
     if (Root) Retain(Root);
 }
-Map::Map(Map &&o) noexcept : Root(o.Root), Size(o.Size) {
-    o.Root = nullptr;
-    o.Size = 0;
-}
+Map::Map(Map &&o) noexcept : Root(std::exchange(o.Root, nullptr)), Size(std::exchange(o.Size, 0)) {}
 Map::~Map() {
     if (Root) Release(Root);
 }

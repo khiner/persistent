@@ -4,7 +4,7 @@
 
 #include "Hamt.h"
 
-// Included with plain -I rather than -isystem (see bench/CMakeLists.txt), so silence immer's warnings here.
+// Included with plain -I rather than -isystem (see the top-level CMakeLists.txt), so silence immer's warnings here.
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wunused-parameter"
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
@@ -16,6 +16,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <iterator>
 #include <random>
 #include <string_view>
 #include <utility>
@@ -49,6 +50,9 @@ enum class Pattern { Random,
                      Pointer16,
                      Pointer64 };
 constexpr const char *PatternNames[]{"random", "sequential", "pointer x16", "pointer x64"};
+// A counter, and two rates of heap address, one object per 16 or 64 bytes. Unused for random keys.
+constexpr uint64_t PatternStrides[]{0, 1, 16, 64};
+constexpr int PatternCount = std::size(PatternNames);
 
 // `run` separates the present keys from the absent ones without changing the shape of either.
 std::vector<uint64_t> Keys(uint64_t n, Pattern p, uint64_t run) {
@@ -58,9 +62,7 @@ std::vector<uint64_t> Keys(uint64_t n, Pattern p, uint64_t run) {
         for (auto &key : keys) key = rng();
         return keys;
     }
-    // A counter, and two rates of heap address, one object per 16 or 64 bytes.
-    const uint64_t base = p == Pattern::Sequential ? 0 : 0x600000000000ull, stride = p == Pattern::Pointer16 ? 16 : p == Pattern::Pointer64 ? 64 :
-                                                                                                                                              1;
+    const uint64_t base = p == Pattern::Sequential ? 0 : 0x600000000000ull, stride = PatternStrides[int(p)];
     for (uint64_t i = 0; i < n; ++i) keys[i] = base + (run * n + i) * stride;
     return keys;
 }
@@ -126,16 +128,14 @@ int main(int argc, char **argv) {
     std::vector<Pattern> patterns{Pattern::Random};
     if (argc > 1 && !std::isdigit(static_cast<unsigned char>(argv[1][0]))) {
         ++arg;
+        // "all" takes every pattern and "pointer" both strides, so a name can select more than one.
         const std::string_view name{argv[1]};
-        if (name == "all") patterns = {Pattern::Random, Pattern::Sequential, Pattern::Pointer16, Pattern::Pointer64};
-        else {
-            patterns.clear();
-            for (int i = 0; i < 4; ++i)
-                if (name == PatternNames[i] || (name == "pointer" && i >= 2)) patterns.push_back(Pattern(i));
-            if (patterns.empty()) {
-                std::printf("unknown key pattern '%s'\n", argv[1]);
-                return 1;
-            }
+        patterns.clear();
+        for (int i = 0; i < PatternCount; ++i)
+            if (name == "all" || name == PatternNames[i] || (name == "pointer" && i >= int(Pattern::Pointer16))) patterns.push_back(Pattern(i));
+        if (patterns.empty()) {
+            std::printf("unknown key pattern '%s'\n", argv[1]);
+            return 1;
         }
     }
     for (const auto pattern : patterns) {
