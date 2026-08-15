@@ -20,13 +20,11 @@ static_assert(Bits == 5 || Bits == 6, "A slot map has to be exactly one machine 
 using Bitmap = std::conditional_t<Bits == 6, uint64_t, uint32_t>;
 constexpr Bitmap Mask = (Bitmap{1} << Bits) - 1;
 
-// Each fold is a bijection, so distinct keys never share a hash and the trie always separates them
-// before it bottoms out -- which is why there are no collision nodes. Rationale in docs/Literature.md.
-constexpr uint64_t Hash(uint64_t x) {
-    x ^= x >> 32;
-    x ^= x >> 16;
-    return x;
-}
+// The fold is a bijection, so distinct keys never share a hash and the trie always separates them
+// before it bottoms out, which is why there are no collision nodes. It folds the top half of the key
+// down and stops there. A second fold would reach into bits that a strided key set does not vary,
+// spreading keys that were adjacent. Rationale in docs/Literature.md.
+constexpr uint64_t Hash(uint64_t x) { return x ^ (x >> 32); }
 
 constexpr uint32_t Idx(uint64_t hash, uint32_t shift) { return static_cast<uint32_t>((hash >> shift) & Mask); }
 } // namespace
@@ -38,13 +36,17 @@ static_assert(Iterator::MaxDepth >= (64 + Bits - 1) / Bits, "The iterator stack 
 // slot's position is the popcount of the lower bits. `Refs` is not atomic: no cross-thread sharing.
 struct alignas(8) Node {
     mutable uint32_t Refs;
-    // popcount(Nodemap), where the entries start. Cached because they sit behind the children.
-    uint32_t Children;
+    // The popcounts of the two maps: where the entries start, since they sit behind the children, and
+    // how many of them there are. They cost nothing to keep, because the bitmaps have to be 8-byte
+    // aligned and so leave half a word spare beside the refcount at either branching factor. Iteration,
+    // equality and every write want the entry count, and on ARM a popcount is a move to a vector
+    // register, a count and a move back.
+    uint16_t Children, Data;
     Bitmap Datamap, Nodemap;
 };
 
 namespace {
-uint32_t DataCount(const Node &n) { return std::popcount(n.Datamap); }
+uint32_t DataCount(const Node &n) { return n.Data; }
 uint32_t ChildCount(const Node &n) { return n.Children; }
 uint32_t DataOffset(const Node &n, Bitmap bit) { return std::popcount(n.Datamap & (bit - 1)); }
 uint32_t ChildOffset(const Node &n, Bitmap bit) { return std::popcount(n.Nodemap & (bit - 1)); }
@@ -60,18 +62,48 @@ Node *Mutable(const Node *n) { return const_cast<Node *>(n); }
 void Retain(const Node *n) { ++n->Refs; }
 
 // A node's size in 8-byte words. Recoverable from the bitmaps, so a node never stores its own size.
+// Rounded up to a pair of words, so that every node is 16-byte aligned and its header cannot straddle
+// a cache line. An 8-byte aligned header straddles one visit in eight, and the rounding costs four
+// bytes per node on average.
 constexpr uint32_t Words(Bitmap datamap, Bitmap nodemap) {
-    return uint32_t(sizeof(Node) / 8) + std::popcount(datamap) * uint32_t(sizeof(Entry) / 8) + std::popcount(nodemap);
+    const auto words = uint32_t(sizeof(Node) / 8) + std::popcount(datamap) * uint32_t(sizeof(Entry) / 8) + std::popcount(nodemap);
+    return (words + 1) & ~uint32_t{1};
 }
 
-// Freed nodes go to a list per size rather than back to the allocator, so the memory stays ours until
-// exit. That also blinds the sanitizers: a freed node stays reachable and gets handed out again, so a
-// leak looks live. Under -DHAMT_AUDIT nodes go back to the allocator and the live ones are counted.
+// Nodes are cut from slabs, one size to a slab, and a freed node goes back to the slab it came from
+// rather than to the allocator, so the memory stays ours until exit. That blinds the sanitizers: a
+// freed node stays reachable and gets handed out again, so a leak looks live. Under -DHAMT_AUDIT
+// nodes go back to the allocator and the live ones are counted.
+//
+// Which freed node a build gets back decides how spread out a map is. A single free list per size
+// returns whatever was released last, wherever it came from, so a map built after a large one has been
+// dropped is made of that one's nodes and spans everything the process has touched. Per slab, reuse
+// stays within memory the size already holds. Measured on the benchmark's last configuration, after
+// every earlier one has been through the allocator: lookup was 66% slower than the same map built in a
+// fresh process, and is now within noise of it. Where a slab sits in its list once it has room again
+// matters too -- see `Release`.
 #ifdef HAMT_AUDIT
 uint64_t Live = 0;
 #else
 constexpr uint32_t SizeClasses = Words(~Bitmap{0}, 0) + 1; // All entries, the widest a node gets.
-const Node *Freed[SizeClasses]{};
+constexpr uint32_t SlabBytes = 64 * 1024;
+static_assert(SlabBytes > SizeClasses * 8, "A slab has to hold at least one node of its size");
+
+// A slab is aligned to its own size, so clearing the low bits of a node's address finds the slab it
+// came from and a release needs no lookup. One slab serves one size, and allocation stays on a single
+// slab until it is full.
+struct Slab {
+    Slab *Next; // The next slab of this size with room in it.
+    const Node *Free; // Nodes released back into this slab, linked through their dead headers.
+    uint32_t Bump; // How far allocation has cut into it.
+    uint32_t Bytes; // The node size it serves.
+    uint32_t Live; // Nodes it has handed out and not had back.
+    bool Listed; // A full slab leaves the list until a release puts something back.
+};
+
+Slab *Partial[SizeClasses]{};
+
+Slab *SlabOf(const Node *n) { return reinterpret_cast<Slab *>(reinterpret_cast<uintptr_t>(n) & ~uintptr_t(SlabBytes - 1)); }
 #endif
 
 void Release(const Node *n) {
@@ -82,10 +114,33 @@ void Release(const Node *n) {
     --Live;
     std::free(Mutable(n));
 #else
-    auto &list = Freed[Words(n->Datamap, n->Nodemap)];
-    // The header is dead now, so the link to the next free node lives in it.
-    *reinterpret_cast<const Node **>(Mutable(n)) = list;
-    list = n;
+    auto *slab = SlabOf(n);
+    // A slab holding nothing is reset to a fresh one. Dropping a map empties the slabs it filled, and
+    // resetting the bump gives the next map contiguous memory rather than a list of holes.
+    const bool emptied = --slab->Live == 0;
+    if (emptied) {
+        slab->Free = nullptr;
+        slab->Bump = uint32_t(sizeof(Slab));
+    } else {
+        // The header is dead now, so the link to the next free node lives in it.
+        *reinterpret_cast<const Node **>(Mutable(n)) = slab->Free;
+        slab->Free = n;
+    }
+    if (!slab->Listed) {
+        // An emptied slab goes in front, since it is the one worth allocating from. One that has only
+        // lost a node goes behind the slab being filled, so allocation stays put until that slab is
+        // used up. Every build frees as it goes, because growing a node releases the one below it, and
+        // following each release would move allocation across the whole size class.
+        auto &head = Partial[slab->Bytes / 8];
+        if (emptied || !head) {
+            slab->Next = head;
+            head = slab;
+        } else {
+            slab->Next = head->Next;
+            head->Next = slab;
+        }
+        slab->Listed = true;
+    }
 #endif
 }
 
@@ -120,16 +175,29 @@ Node *Alloc(Bitmap datamap, Bitmap nodemap) {
     ++Live;
     n = static_cast<Node *>(std::malloc(words * 8));
 #else
-    auto &list = Freed[words];
-    if (list) {
-        n = Mutable(list);
-        list = *reinterpret_cast<const Node *const *>(n);
+    const auto bytes = words * 8;
+    auto *slab = Partial[words];
+    if (!slab) {
+        slab = static_cast<Slab *>(std::aligned_alloc(SlabBytes, SlabBytes));
+        *slab = {nullptr, nullptr, uint32_t(sizeof(Slab)), bytes, 0, true};
+        Partial[words] = slab;
+    }
+    ++slab->Live;
+    if (slab->Free) {
+        n = Mutable(slab->Free);
+        slab->Free = *reinterpret_cast<const Node *const *>(n);
     } else {
-        n = static_cast<Node *>(std::malloc(words * 8));
+        n = reinterpret_cast<Node *>(reinterpret_cast<char *>(slab) + slab->Bump);
+        slab->Bump += bytes;
+    }
+    if (!slab->Free && slab->Bump + bytes > SlabBytes) { // Nothing left in it, so off the list.
+        Partial[words] = slab->Next;
+        slab->Listed = false;
     }
 #endif
     n->Refs = 1;
-    n->Children = std::popcount(nodemap);
+    n->Children = uint16_t(std::popcount(nodemap));
+    n->Data = uint16_t(std::popcount(datamap));
     n->Datamap = datamap;
     n->Nodemap = nodemap;
     return n;
@@ -274,8 +342,8 @@ bool SameNodes(const Node *a, const Node *b) {
 // and child sits in the slot its hash selects, and that no node is empty or collapsible.
 bool CheckNode(const Node *n, uint32_t shift, uint64_t prefix, uint64_t &count) {
     if (n->Datamap & n->Nodemap) return false; // A slot holds an entry or a child, never both.
-    // Before anything reads an entry: the cached count is what places the entry array.
-    if (n->Children != uint32_t(std::popcount(n->Nodemap))) return false;
+    // Before anything reads an entry: the cached counts are what place and bound the entry array.
+    if (n->Children != std::popcount(n->Nodemap) || n->Data != std::popcount(n->Datamap)) return false;
     const auto dc = DataCount(*n), nc = ChildCount(*n);
     if (dc + nc == 0) return false; // Empty nodes are never built, not even at the root.
     if (shift > 0 && nc == 0 && dc == 1) return false; // A lone entry belongs inlined in the parent.
@@ -294,11 +362,15 @@ bool CheckNode(const Node *n, uint32_t shift, uint64_t prefix, uint64_t &count) 
     return true;
 }
 
+// A node with no children gets no frame. Most nodes in a trie have none, and pushing a frame only to
+// find it empty and pop it is most of what visiting one costs.
 void Descend(Iterator &it, const Node *n) {
     it.Cur = Entries(n);
     it.End = it.Cur + DataCount(*n);
-    const auto *const *cs = Children(n);
-    it.Stack[it.Depth++] = {cs, cs + ChildCount(*n)};
+    if (const auto nc = ChildCount(*n)) {
+        const auto *const *cs = Children(n);
+        it.Stack[it.Depth++] = {cs, cs + nc};
+    }
 }
 } // namespace
 
@@ -347,19 +419,23 @@ Map Erase(Map m, uint64_t key) {
     return m;
 }
 
-std::optional<uint64_t> Get(const Map &m, uint64_t key) {
-    const auto hash = Hash(key);
-    uint32_t shift = 0;
-    for (const auto *n = m.Root; n; shift += Bits) {
-        const Bitmap bit = Bitmap{1} << Idx(hash, shift);
-        if (n->Datamap & bit) {
-            const auto &e = Entries(n)[DataOffset(*n, bit)];
-            return e.Key == key ? std::optional{e.Value} : std::nullopt;
+const uint64_t *Get(const Map &m, uint64_t key) {
+    const auto *n = m.Root;
+    if (!n) return nullptr;
+    // Shifting the hash costs an instruction less per level than indexing it at a running shift. The
+    // loop has no condition because a slot holding a child is never null, so the walk ends by
+    // returning. The child map is tested first because most levels descend, and the maps are disjoint,
+    // so either order is correct.
+    for (auto hash = Hash(key);; hash >>= Bits) {
+        const Bitmap bit = Bitmap{1} << (hash & Mask);
+        if (n->Nodemap & bit) {
+            n = Children(n)[ChildOffset(*n, bit)];
+            continue;
         }
-        if (!(n->Nodemap & bit)) break;
-        n = Children(n)[ChildOffset(*n, bit)];
+        if (!(n->Datamap & bit)) return nullptr;
+        const auto &e = Entries(n)[DataOffset(*n, bit)];
+        return e.Key == key ? &e.Value : nullptr;
     }
-    return {};
 }
 
 bool operator==(const Map &a, const Map &b) {
@@ -384,13 +460,18 @@ std::optional<uint64_t> LiveNodes() {
 }
 
 void Iterator::Advance() {
+    // Both ends of the frame are read into locals first. Read through the frame instead, clang loads
+    // the pair into a vector register and moves it back out, which lands on the path between nodes.
     while (Depth) {
         auto &frame = Stack[Depth - 1];
-        if (frame.Child == frame.ChildEnd) {
+        const auto *const *child = frame.Child;
+        const auto *const *end = frame.ChildEnd;
+        if (child == end) {
             --Depth;
             continue;
         }
-        Descend(*this, *frame.Child++);
+        frame.Child = child + 1;
+        Descend(*this, *child);
         if (Cur != End) return;
     }
     Cur = End = nullptr;

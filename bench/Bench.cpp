@@ -12,6 +12,8 @@
 #include <immer/map_transient.hpp>
 #pragma clang diagnostic pop
 
+#include <pthread.h>
+
 #include <cctype>
 #include <chrono>
 #include <cstdio>
@@ -28,23 +30,36 @@ using ImmerMap = immer::map<uint64_t, uint64_t>;
 
 // Nanoseconds per operation, best of `Rounds`. Timing noise only ever adds, so the minimum is the
 // closest we get to the real cost. `Sink` is there to keep the optimizer from deleting the work.
-constexpr uint32_t Rounds = 5;
+//
+// A round repeats the work until it has run for `MinRoundNanos`, then divides by the number of
+// repeats. A thousand lookups take a couple of microseconds, close enough to the clock's own cost that
+// the reading is mostly noise, so the small sizes are only comparable once a round runs for
+// milliseconds.
+constexpr uint32_t Rounds = 9;
+constexpr double MinRoundNanos = 2e6;
 uint64_t Sink = 0;
 
 template<typename F> double Time(uint64_t ops, F &&f) {
     double best = 1e300;
     for (uint32_t i = 0; i < Rounds; ++i) {
+        uint64_t reps = 0;
+        double ns;
         const auto start = Clock::now();
-        Sink += f();
-        const auto ns = std::chrono::duration<double, std::nano>(Clock::now() - start).count();
-        best = ns < best ? ns : best;
+        do {
+            Sink += f();
+            ++reps;
+            ns = std::chrono::duration<double, std::nano>(Clock::now() - start).count();
+        } while (ns < MinRoundNanos);
+        const auto per_op = ns / double(ops * reps);
+        best = per_op < best ? per_op : best;
     }
-    return best / double(ops);
+    return best;
 }
 
-// Key shape matters as much as key count. immer feeds the key straight to the trie, so a dense key
-// set gives it a dense trie while one with zeroed low bits wastes whole levels. We fold, so all four
-// look much the same to us.
+// Key shape matters as much as key count. immer feeds the key straight to the trie, so a dense key set
+// gives it a dense trie and one with zeroed low bits wastes whole levels. Our fold leaves both shapes
+// alone, so these sweeps compare like with like. A hash that scrambled would trade the wasted levels
+// for a sparse trie on every shape.
 enum class Pattern { Random,
                      Sequential,
                      Pointer16,
@@ -80,7 +95,7 @@ ImmerMap ImmerBuilt(const std::vector<uint64_t> &keys) {
 }
 
 void Row(const char *name, double ours, double immer) {
-    std::printf("  %-14s %8.1f %8.1f   %+6.1f%%\n", name, ours, immer, 100 * (immer - ours) / immer);
+    std::printf("  %-14s %8.2f %8.2f   %+6.1f%%\n", name, ours, immer, 100 * (immer - ours) / immer);
 }
 
 void Run(uint64_t n, Pattern pattern) {
@@ -100,7 +115,7 @@ void Run(uint64_t n, Pattern pattern) {
         Time(n, [&] { uint64_t s = 0; for (auto key : keys) s += *hamt::Get(ours, key); return s; }),
         Time(n, [&] { uint64_t s = 0; for (auto key : keys) s += *theirs.find(key); return s; }));
     Row("lookup miss",
-        Time(n, [&] { uint64_t s = 0; for (auto key : absent) s += hamt::Get(ours, key).has_value(); return s; }),
+        Time(n, [&] { uint64_t s = 0; for (auto key : absent) s += hamt::Get(ours, key) != nullptr; return s; }),
         Time(n, [&] { uint64_t s = 0; for (auto key : absent) s += theirs.find(key) != nullptr; return s; }));
     Row("erase move",
         Time(n, [&] { auto m = ours; for (auto key : keys) m = hamt::Erase(std::move(m), key); return m.Size; }),
@@ -118,6 +133,10 @@ void Run(uint64_t n, Pattern pattern) {
 } // namespace
 
 int main(int argc, char **argv) {
+    // Apple silicon runs a plain process on whichever core is free, and an efficiency core is about
+    // half as fast here. Best-of-`Rounds` only hides that when some round lands on a performance core,
+    // so without this the readings are bimodal.
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
     std::printf("ns/op, lower is better. Last column is our margin over immer.\n");
     // An optional leading key pattern, then sizes.
     //   HamtBench                     the three default sizes on random keys

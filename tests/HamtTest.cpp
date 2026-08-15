@@ -44,7 +44,10 @@ Bindings Sorted(const immer::map<uint64_t, uint64_t> &m) {
 
 template<typename T> bool Iterates(const hamt::Map &m, const T &expected) { return Sorted(m) == Sorted(expected); }
 
-bool Holds(const hamt::Map &m, uint64_t key, uint64_t value) { return hamt::Get(m, key) == std::optional{value}; }
+bool Holds(const hamt::Map &m, uint64_t key, uint64_t value) {
+    const auto *found = hamt::Get(m, key);
+    return found && *found == value;
+}
 } // namespace
 
 using namespace boost::ut;
@@ -53,8 +56,8 @@ int main() {
     "empty"_test = [] {
         const hamt::Map m{};
         expect(m.Size == 0_u64);
-        expect(!hamt::Get(m, 0).has_value());
-        expect(!hamt::Get(m, 42).has_value());
+        expect(hamt::Get(m, 0) == nullptr);
+        expect(hamt::Get(m, 42) == nullptr);
     };
 
     "set and get"_test = [] {
@@ -65,7 +68,7 @@ int main() {
         expect(Holds(m, 1, 100));
         expect(Holds(m, 2, 200));
         expect(Holds(m, 3, 300));
-        expect(!hamt::Get(m, 4).has_value());
+        expect(hamt::Get(m, 4) == nullptr);
     };
 
     "overwrite"_test = [] {
@@ -78,13 +81,13 @@ int main() {
         const auto before = hamt::Set({}, 1, 100);
         const auto after = hamt::Set(before, 2, 200);
         expect(before.Size == 1_u64);
-        expect(!hamt::Get(before, 2).has_value());
+        expect(hamt::Get(before, 2) == nullptr);
         expect(after.Size == 2_u64);
         expect(Holds(after, 1, 100));
 
         const auto erased = hamt::Erase(after, 1);
         expect(erased.Size == 1_u64);
-        expect(!hamt::Get(erased, 1).has_value());
+        expect(hamt::Get(erased, 1) == nullptr);
         expect(Holds(after, 1, 100)); // The erase left `after` intact.
     };
 
@@ -161,9 +164,9 @@ int main() {
                 theirs = theirs.set(key, i);
             }
             const auto *expected = theirs.find(key);
-            const auto actual = hamt::Get(ours, key);
+            const auto *actual = hamt::Get(ours, key);
             // Fatal, so the first divergence ends the test instead of flooding the report.
-            expect((actual == (expected ? std::optional{*expected} : std::nullopt)) >> fatal) << "key" << key << "after op" << i;
+            expect((expected ? actual && *actual == *expected : actual == nullptr) >> fatal) << "key" << key << "after op" << i;
         }
         expect(ours.Size == uint64_t{theirs.size()});
         expect(hamt::Check(ours));

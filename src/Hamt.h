@@ -34,7 +34,10 @@ struct Map {
 Map Set(Map m, uint64_t key, uint64_t value);
 // The map without `key`. A miss returns the map unchanged.
 Map Erase(Map m, uint64_t key);
-std::optional<uint64_t> Get(const Map &m, uint64_t key);
+// The value `key` is bound to, or null if it is bound to nothing. The value stays where it is for as
+// long as `m` holds it, so the pointer outlives the call but not an update that displaces the entry.
+// A pointer rather than an `optional`, so that a caller who only reads the value avoids the copy.
+const uint64_t *Get(const Map &m, uint64_t key);
 
 // Whether the two maps hold the same bindings, independent of the order they were built in.
 // Cheap between maps that share history, down to constant time for two that never diverged.
@@ -59,11 +62,16 @@ struct Iterator {
         const Node *const *Child, *const *ChildEnd;
     };
 
-    // Walk state. `Cur` is null exactly at the end, which is what `end()` compares equal to.
+    // Walk state. `Cur` is null exactly at the end, which is what `end()` compares equal to. Only the
+    // frames below `Depth` are meaningful, so the stack is left uninitialized. That is what the
+    // constructors are for: braced initialization would zero all 13 frames instead.
     Map Source;
     const Entry *Cur{}, *End{};
-    Frame Stack[MaxDepth]{};
+    Frame Stack[MaxDepth];
     uint32_t Depth{};
+
+    Iterator() = default;
+    explicit Iterator(const Map &m) : Source(m) {}
 
     const Entry &operator*() const { return *Cur; }
     const Entry *operator->() const { return Cur; }

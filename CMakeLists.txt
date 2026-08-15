@@ -14,8 +14,8 @@ set(CMAKE_INTERPROCEDURAL_OPTIMIZATION ON)
 
 add_subdirectory(lib/ut) # boost::ut, the test framework.
 
-# 6 by default because the sweep says so -- see the first open question in docs/Literature.md.
-set(HAMT_BITS 6 CACHE STRING "Trie branching factor exponent: 5 for 32 slots per node, 6 for 64.")
+# 5 by default because the sweep says so -- see the first open question in docs/Literature.md.
+set(HAMT_BITS 5 CACHE STRING "Trie branching factor exponent: 5 for 32 slots per node, 6 for 64.")
 
 # The same source twice. `hamt_audit` drops the node free list, so freed nodes go back to the
 # allocator and the live ones are counted. Nothing links it but the tests: it is the only build in
