@@ -10,12 +10,12 @@ struct Entry {
     uint64_t Key, Value;
 };
 
-// Persistent map from 64-bit keys to 64-bit values, backed by a hash array mapped trie.
-// Every operation returns a new map and leaves its input intact, with the two sharing all unchanged structure.
-// A map holds a reference to the structure it shares, and shared structure lives until the last map naming it dies.
+// Persistent map from 64-bit keys to 64-bit values, backed by a hash array mapped trie. Every
+// operation returns a new map and leaves its input intact, sharing whatever the two have in common
+// rather than copying it, and releasing it once no map is left holding it.
 //
-// Single threaded, and not per map but altogether: reference counts are not atomic, and the nodes come
-// from one global free list, so two threads whose maps share no structure at all still race.
+// Single threaded, and not per map but altogether: two threads whose maps share no structure at all
+// still race.
 struct Map {
     const Node *Root{};
     uint64_t Size{};
@@ -28,34 +28,29 @@ struct Map {
     Map &operator=(Map);
 };
 
-// `Set` and `Erase` take the map by value, so passing an rvalue hands them sole ownership of it.
+// `Set` and `Erase` take the map by value, so move into them when the old map is no longer wanted
+// and they will reuse it rather than copy.
 // The map with `key` bound to `value`. Rebinding an existing key replaces its value.
 Map Set(Map m, uint64_t key, uint64_t value);
 // The map without `key`. A miss returns the map unchanged.
 Map Erase(Map m, uint64_t key);
-// The value bound to `key`, if any.
 std::optional<uint64_t> Get(const Map &m, uint64_t key);
 
-// Whether the two maps hold the same bindings. The trie is canonical -- shape is a function of
-// contents -- so this is a structural comparison, and any subtree the two share settles by pointer.
+// Whether the two maps hold the same bindings, independent of the order they were built in.
+// Cheap between maps that share history, down to constant time for two that never diverged.
 bool operator==(const Map &a, const Map &b);
 
 // Whether `m` is in canonical form and its size and hash placement agree with its contents.
-// A standing check on the representation invariant, meant for tests: linear in the size of the map.
+// A standing check on the representation invariant, meant for tests. Linear in the size of the map.
 bool Check(const Map &m);
 
-// How many nodes the library is holding, which is a check that maps give their structure back.
-// Only an audit build (-DHAMT_AUDIT) keeps the count, and that build also returns freed nodes to the
-// allocator rather than to the free list, so a sanitizer can see a use after free. Anywhere else this
-// is empty, which says the count is not being kept rather than that it is zero.
+// How many nodes the library is holding, so a test can confirm that maps release what they take.
+// Only an audit build (-DHAMT_AUDIT) keeps it. Empty elsewhere, meaning not counted rather than zero.
 std::optional<uint64_t> LiveNodes();
 
-// Depth-first walk yielding every entry once. The order is unspecified, but it follows from the trie
-// shape alone, so equal maps iterate identically.
-//
-// An iterator names the map it walks, exactly as another map would, and that is what keeps it valid.
-// An update rewrites nodes in place only when the map it was handed holds the sole reference to them,
-// so the iterator's reference is the second name that sends the update down the copying path instead.
+// Depth-first walk yielding every entry once. The order is unspecified but depends only on contents,
+// so equal maps iterate identically. An iterator holds the map it walks, so it stays valid however
+// that map is later updated, and keeps yielding the bindings it had when the walk began.
 struct Iterator {
     // A level consumes at least five hash bits, so a path is at most this long.
     static constexpr uint32_t MaxDepth = 13;
@@ -64,21 +59,21 @@ struct Iterator {
         const Node *const *Child, *const *ChildEnd;
     };
 
-    Map Source; // The reference the walk holds, released when the iterator dies.
-    const Entry *Cur{}, *End{}; // The entries of the node being yielded from. `Cur` is null at the end.
+    // Walk state. `Cur` is null exactly at the end, which is what `end()` compares equal to.
+    Map Source;
+    const Entry *Cur{}, *End{};
     Frame Stack[MaxDepth]{};
     uint32_t Depth{};
 
     const Entry &operator*() const { return *Cur; }
     const Entry *operator->() const { return Cur; }
     bool operator==(const Iterator &o) const { return Cur == o.Cur; }
-    // A node's entries are contiguous, so a step is a pointer bump until the node runs out.
     Iterator &operator++() {
         if (++Cur == End) Advance();
         return *this;
     }
 
-    // Moves to the next node holding entries, or reports the end by clearing `Cur`.
+    // Moves on to the next entries there are, or reports the end by clearing `Cur`.
     void Advance();
 };
 

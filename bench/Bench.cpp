@@ -4,7 +4,7 @@
 
 #include "Hamt.h"
 
-// Included with plain -I rather than -isystem (see the top-level CMakeLists.txt), so silence immer's warnings here.
+// immer is not included as a system header (see the top-level CMakeLists.txt), so silence its warnings.
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wunused-parameter"
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
@@ -42,9 +42,9 @@ template<typename F> double Time(uint64_t ops, F &&f) {
     return best / double(ops);
 }
 
-// How the keys are shaped matters as much as how many there are. immer feeds the key straight to the
-// trie, so a dense key set gives it a dense trie and every key the same depth, while a key set with
-// zeroed low bits wastes whole levels. We mix, so all four of these look the same to us.
+// Key shape matters as much as key count. immer feeds the key straight to the trie, so a dense key
+// set gives it a dense trie while one with zeroed low bits wastes whole levels. We fold, so all four
+// look much the same to us.
 enum class Pattern { Random,
                      Sequential,
                      Pointer16,
@@ -108,7 +108,7 @@ void Run(uint64_t n, Pattern pattern) {
     Row("iterate",
         Time(n, [&] { uint64_t s = 0; for (const auto &e : ours) s += e.Value; return s; }),
         Time(n, [&] { uint64_t s = 0; for (const auto &e : theirs) s += e.second; return s; }));
-    // Built separately from the same keys, so the two maps share nothing and equality has to walk them.
+    // Built separately from the same keys, so equality has no shared history to short-circuit on.
     const auto ours_twin = Built(keys);
     const auto theirs_twin = ImmerBuilt(keys);
     Row("equal",
@@ -119,8 +119,7 @@ void Run(uint64_t n, Pattern pattern) {
 
 int main(int argc, char **argv) {
     std::printf("ns/op, lower is better. Last column is our margin over immer.\n");
-    // An optional leading key pattern, then sizes, for sweeping a curve finer than the defaults
-    // resolve or for driving the shapes a counter and a heap allocator actually produce.
+    // An optional leading key pattern, then sizes.
     //   HamtBench                     the three default sizes on random keys
     //   HamtBench sequential 1000000  one size, one pattern
     //   HamtBench all 100000          every pattern at one size

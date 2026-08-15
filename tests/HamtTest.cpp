@@ -1,17 +1,14 @@
-// Aspirational tests for the from-scratch HAMT. The oracle is immer::map (the reference implementation
-// in /immer), driven through the same operation sequence and required to agree on every lookup.
-//
-// Built twice, and both are worth running:
+// Tests for the from-scratch HAMT. The oracle is immer::map, driven through the same operation
+// sequence and required to agree on every lookup. Both builds are worth running:
 //   cmake --build build --target HamtTest HamtAuditTest
 //   ./build/tests/HamtTest && ./build/tests/HamtAuditTest
-// HamtAuditTest links the library without its node free list, which is the only build where the
-// reclamation check below can see anything, and the only one a sanitizer can say much about.
+// HamtAuditTest drops the node free list, which is what lets the reclamation check below see anything.
 
 #include "Hamt.h"
 
 #include <boost/ut.hpp>
 
-// Included with plain -I rather than -isystem (see the top-level CMakeLists.txt), so silence immer's warnings here.
+// immer is not included as a system header (see the top-level CMakeLists.txt), so silence its warnings.
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wunused-parameter"
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
@@ -45,10 +42,8 @@ Bindings Sorted(const immer::map<uint64_t, uint64_t> &m) {
     return Sorted(std::move(v));
 }
 
-// The map iterates exactly the bindings `expected` holds.
 template<typename T> bool Iterates(const hamt::Map &m, const T &expected) { return Sorted(m) == Sorted(expected); }
 
-// `key` is bound, and to `value`.
 bool Holds(const hamt::Map &m, uint64_t key, uint64_t value) { return hamt::Get(m, key) == std::optional{value}; }
 } // namespace
 
@@ -114,7 +109,7 @@ int main() {
     };
 
     "equality"_test = [] {
-        // Built in opposite orders, so the two share nothing and have to agree structurally.
+        // Built in opposite orders, so equality has no shared history to fall back on.
         hamt::Map forward{}, backward{};
         for (uint64_t i = 0; i < 1'000; ++i) forward = hamt::Set(std::move(forward), i * 7, i);
         for (uint64_t i = 1'000; i-- > 0;) backward = hamt::Set(std::move(backward), i * 7, i);
@@ -127,9 +122,8 @@ int main() {
     };
 
     "full depth"_test = [] {
-        // Keys whose hashes differ only in the top four bits, so they agree on every level but the
-        // last and drive the trie to its full depth -- a path random keys never take. The step is
-        // what the hash's inverse maps 1 << 60 to, so stepping the key by it steps the hash by that.
+        // Keys whose hashes differ only in the top four bits, driving the trie to its full depth --
+        // a path random keys never take. The step is what the hash's inverse maps 1 << 60 to.
         constexpr uint64_t Step = 0x1000100000000000ull;
         constexpr uint64_t N = 8;
         hamt::Map m{};
@@ -152,7 +146,7 @@ int main() {
     };
 
     "immer parity"_test = [] {
-        // Random sets and erases over a small key range, so overwrites, misses, and collisions all occur.
+        // A small key range, so overwrites, misses, and collisions all occur.
         std::mt19937_64 rng{42};
         std::uniform_int_distribution<uint64_t> key_dist{0, 1 << 12};
         hamt::Map ours{};
@@ -177,8 +171,8 @@ int main() {
     };
 
     "canonical form"_test = [] {
-        // A key range small enough that the same contents are reached over and over by different routes.
-        // Canonicality says every route ends at the same trie, so the invariant holds after every step.
+        // A key range small enough to reach the same contents by many routes, all of which
+        // canonicality says must end at the same trie.
         std::mt19937_64 rng{11};
         std::uniform_int_distribution<uint64_t> key_dist{0, 64};
         hamt::Map ours{};
@@ -193,9 +187,8 @@ int main() {
     };
 
     "in-place reuse"_test = [] {
-        // Updating through an rvalue hands sole ownership over, so uniquely owned nodes are rewritten
-        // in place instead of copied. A snapshot taken part way through gives every node it can reach
-        // a second name, and must be left untouched by every update that follows.
+        // Moving into an update lets it reuse the old map's nodes rather than copy them. A snapshot
+        // taken part way through has to survive every update that follows.
         std::mt19937_64 rng{7};
         std::uniform_int_distribution<uint64_t> key_dist{0, 1 << 10};
         hamt::Map ours{};
@@ -225,8 +218,8 @@ int main() {
     };
 
     "iterating pins the structure"_test = [] {
-        // An iterator names the map, so an update handed that same map is not its sole owner and has
-        // to copy. Without that, the update would rewrite the very nodes being walked, in place.
+        // The walk has to keep yielding the bindings the map had when it began, even as that same
+        // map is rebound underneath it.
         constexpr uint64_t N = 200;
         hamt::Map m{};
         for (uint64_t i = 0; i < N; ++i) m = hamt::Set(std::move(m), i * 3, i);
@@ -242,9 +235,8 @@ int main() {
     };
 
     "reclamation"_test = [] {
-        // Nodes are reference counted, and every other test here would pass just the same if a count
-        // leaked or went one too far. Only the audit build can see it -- elsewhere the free list keeps
-        // a freed node reachable and hands it out again.
+        // Every other test here would pass just the same if a reference count leaked or went one too
+        // far. Only the audit build can see it.
         constexpr uint64_t N = 5'000;
         {
             std::mt19937_64 rng{3};
@@ -252,9 +244,9 @@ int main() {
             hamt::Map m{};
             for (uint64_t i = 0; i < N; ++i) {
                 keys.push_back(rng());
-                m = hamt::Set(std::move(m), keys.back(), i); // Sole ownership, so paths are rewritten in place.
+                m = hamt::Set(std::move(m), keys.back(), i); // Moved, so paths are reused in place.
             }
-            const auto shared = m; // A second name, so every erase below copies its path instead.
+            const auto shared = m; // So every erase below has to copy its path instead.
             for (const auto key : keys) m = hamt::Erase(m, key);
             expect(m.Size == 0_u64);
             expect(shared.Size == N);

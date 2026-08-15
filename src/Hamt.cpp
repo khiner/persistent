@@ -7,7 +7,7 @@
 #include <type_traits>
 #include <utility>
 
-// Branching factor exponent, so 32 slots per node at 5 and 64 at 6. Set from CMake to sweep it.
+// Branching factor exponent: 32 slots per node at 5, 64 at 6.
 #ifndef HAMT_BITS
 #define HAMT_BITS 5
 #endif
@@ -20,39 +20,25 @@ static_assert(Bits == 5 || Bits == 6, "A slot map has to be exactly one machine 
 using Bitmap = std::conditional_t<Bits == 6, uint64_t, uint32_t>;
 constexpr Bitmap Mask = (Bitmap{1} << Bits) - 1;
 
-// Fold the high bits down twice, then read the trie from the bottom up. Each fold is a bijection on
-// uint64, so distinct keys never share a hash, and the levels between them consume all 64 hash bits
-// -- any two keys separate before the trie bottoms out. That is why there are no collision nodes here.
-//
-// What the folding is for is the two ways a real key set is not random. A fold maps [0, 2^k) into
-// itself, so a dense key set stays dense, and dense is the best case a trie has: every node full,
-// every key at the same depth, neighbouring keys in the same node. A counter or a table of object
-// ids hands us that for free, and multiplying would throw it away. Meanwhile a key set that arrives
-// aligned -- heap addresses, anything scaled by a power of two -- has low bits that never vary, and
-// reading those first would spend whole levels resolving nothing. Folding fills them in from bits
-// that do vary. An identity hash keeps the first property and loses the second.
+// Each fold is a bijection, so distinct keys never share a hash and the trie always separates them
+// before it bottoms out -- which is why there are no collision nodes. Rationale in docs/Literature.md.
 constexpr uint64_t Hash(uint64_t x) {
     x ^= x >> 32;
     x ^= x >> 16;
     return x;
 }
 
-// The next `Bits` of the hash above the `shift` bits the path here has already consumed.
 constexpr uint32_t Idx(uint64_t hash, uint32_t shift) { return static_cast<uint32_t>((hash >> shift) & Mask); }
 } // namespace
 
 static_assert(Iterator::MaxDepth >= (64 + Bits - 1) / Bits, "The iterator stack has to hold a whole path");
 
-// A CHAMP node. `Datamap` marks the slots holding an inline entry, `Nodemap` the slots holding a
-// child, and no slot is in both. Children and entries trail the header in that order, each packed
-// to the set bits of its map, so a slot's position is the popcount of the lower bits.
-// `Refs` counts the maps and parent nodes naming this one. It is not atomic: sharing a map across
-// threads is not supported, and rpds measures the atomic version at up to 2x on this traffic.
+// A CHAMP node. `Datamap` marks the slots holding an inline entry, `Nodemap` those holding a child,
+// never both. Children then entries trail the header, each packed to the set bits of its map, so a
+// slot's position is the popcount of the lower bits. `Refs` is not atomic: no cross-thread sharing.
 struct alignas(8) Node {
     mutable uint32_t Refs;
-    // popcount(Nodemap), which is where the entries start. Cached because the entries are behind the
-    // children, so every walk that ends in one would otherwise pay a popcount to find them, and
-    // because it costs nothing: the alignment the bitmaps need leaves this word spare at both widths.
+    // popcount(Nodemap), where the entries start. Cached because they sit behind the children.
     uint32_t Children;
     Bitmap Datamap, Nodemap;
 };
@@ -63,36 +49,24 @@ uint32_t ChildCount(const Node &n) { return n.Children; }
 uint32_t DataOffset(const Node &n, Bitmap bit) { return std::popcount(n.Datamap & (bit - 1)); }
 uint32_t ChildOffset(const Node &n, Bitmap bit) { return std::popcount(n.Nodemap & (bit - 1)); }
 
-// Children come first so that descending a level costs one popcount and no arithmetic on the base.
-// That is the step a lookup repeats, against a single entry access at the end of it.
 const Node **Children(Node *n) { return reinterpret_cast<const Node **>(n + 1); }
 const Node *const *Children(const Node *n) { return reinterpret_cast<const Node *const *>(n + 1); }
 Entry *Entries(Node *n) { return reinterpret_cast<Entry *>(Children(n) + ChildCount(*n)); }
 const Entry *Entries(const Node *n) { return reinterpret_cast<const Entry *>(Children(n) + ChildCount(*n)); }
 
-// Nodes live in malloc'd storage, never in read-only memory, so writing through this is well formed.
-// Only reachable when the node is uniquely owned, which is what makes the write unobservable.
+// Nodes are malloc'd, never in fact const. Only reached when the node is uniquely owned.
 Node *Mutable(const Node *n) { return const_cast<Node *>(n); }
 
 void Retain(const Node *n) { ++n->Refs; }
 
-// A node's size, in the 8-byte words it is always a whole number of. Recoverable from the bitmaps
-// alone, which is what lets a node be returned to the right free list without storing its size.
+// A node's size in 8-byte words. Recoverable from the bitmaps, so a node never stores its own size.
 constexpr uint32_t Words(Bitmap datamap, Bitmap nodemap) {
     return uint32_t(sizeof(Node) / 8) + std::popcount(datamap) * uint32_t(sizeof(Entry) / 8) + std::popcount(nodemap);
 }
 
-// Freed nodes go to a list per size, rather than back to the allocator. A trie churns nodes of a few
-// dozen sizes at a rate malloc is not built for, and the node a path copy frees is nearly always the
-// size the next one wants. immer does the same thing for the same reason.
-// The cost is that the memory stays ours until exit. The lists hold every node the process has freed.
-//
-// It costs the sanitizers too, which is what the audit build is for. A freed node stays reachable and
-// gets handed out again, so a leak is indistinguishable from a live node and a use after free reads as
-// an ordinary access. A double release is not caught where it happens either: the link below overwrites
-// `Refs`, so the decrement lands in half a pointer, and what surfaces is a node handed out at the wrong
-// size somewhere else entirely. Under -DHAMT_AUDIT nodes go straight back to the allocator and the live
-// ones are counted, which puts all three back within reach of a test and of asan, at the site.
+// Freed nodes go to a list per size rather than back to the allocator, so the memory stays ours until
+// exit. That also blinds the sanitizers: a freed node stays reachable and gets handed out again, so a
+// leak looks live. Under -DHAMT_AUDIT nodes go back to the allocator and the live ones are counted.
 #ifdef HAMT_AUDIT
 uint64_t Live = 0;
 #else
@@ -117,15 +91,15 @@ void Release(const Node *n) {
 
 void Copy(Entry *dst, const Entry *src, uint32_t n) { std::memcpy(dst, src, n * sizeof(Entry)); }
 
-// Children are copied by reference, so every copy claims one. A child left out of a copy keeps
-// the reference its old parent holds, and a freshly built child is assigned rather than copied.
+// Children are copied by reference, so every copy claims one.
 void Copy(const Node **dst, const Node *const *src, uint32_t n) {
     std::memcpy(static_cast<void *>(dst), static_cast<const void *>(src), n * sizeof(const Node *));
     for (uint32_t i = 0; i < n; ++i) Retain(dst[i]);
 }
 
 // One edit to a node's entry or child array as the node is copied: at `Off`, drop what was there
-// when `Del` and write `Ins` when it is given. Both together is a replacement, neither a plain copy.
+// when `Del` and store `Ins` when it is given. Both together is a replacement, neither a plain copy.
+// `Ins` is stored as it stands, so a child goes in with the reference the new node then holds.
 template<typename T> struct Edit {
     uint32_t Off{};
     bool Del{};
@@ -134,11 +108,11 @@ template<typename T> struct Edit {
 
 template<typename T> void Splice(T *dst, const T *src, uint32_t n, Edit<T> e) {
     Copy(dst, src, e.Off);
-    if (e.Ins) dst[e.Off] = *e.Ins; // Not copied, so no reference is claimed: it arrives owning one.
+    if (e.Ins) dst[e.Off] = *e.Ins;
     Copy(dst + e.Off + (e.Ins != nullptr), src + e.Off + e.Del, n - e.Off - e.Del);
 }
 
-// The returned node carries the one reference its caller is expected to hand on.
+// Carries one reference, which passes to the caller.
 Node *Alloc(Bitmap datamap, Bitmap nodemap) {
     const auto words = Words(datamap, nodemap);
     Node *n;
@@ -162,12 +136,8 @@ Node *Alloc(Bitmap datamap, Bitmap nodemap) {
 }
 
 // A fresh node holding `n`'s contents under the given bitmaps, with one edit to each of its arrays.
-// Every way the trie rewrites a node is one of these, which is why they all read as one line below.
-//
-// Inlined on purpose, and measurably: every caller passes a literal `Edit`, so inlining folds away
-// the tests on `Del` and `Ins` and leaves each caller the straight-line copy it would have spelled
-// out by hand. Left to itself the compiler emits one shared out-of-line copy instead, which costs
-// about 1% across the benchmark -- most of it on the path-copying rows, which is where this lives.
+// Inlined so that a known `Edit` folds the tests on it away, which is worth about 1% on the write
+// rows -- out of line, one shared copy has to branch on all of them.
 [[gnu::always_inline]] Node *Rebuilt(const Node *n, Bitmap datamap, Bitmap nodemap, Edit<Entry> de, Edit<const Node *> ce) {
     auto *c = Alloc(datamap, nodemap);
     Splice(Entries(c), Entries(n), DataCount(*n), de);
@@ -183,31 +153,24 @@ Node *WithEntryPromoted(const Node *n, Bitmap bit, const Node *child) {
     return Rebuilt(n, n->Datamap ^ bit, n->Nodemap | bit, {DataOffset(*n, bit), true}, {ChildOffset(*n, bit), false, &child});
 }
 
-// The reverse: a child that has collapsed to its last entry folds back into the entry side.
-// This is what keeps the trie canonical, so shape is a function of contents alone.
+// The reverse, and what keeps the trie canonical: a child down to its last entry folds back inline.
 Node *WithChildInlined(const Node *n, Bitmap bit, Entry e) {
     return Rebuilt(n, n->Datamap | bit, n->Nodemap ^ bit, {DataOffset(*n, bit), false, &e}, {ChildOffset(*n, bit), true});
 }
 
-// The two in-place rewrites, each paired with the copy it falls back to. An owned node is named
-// exactly once, so no other map can see the write, and returning `n` itself says that is what
-// happened -- which is what lets the whole path above it stay untouched too.
-//
-// Both are inlined for the same reason `Rebuilt` is, and `WithChild` more urgently: an update calls
-// it once per level, so left out of line it puts a call in the middle of every path copy.
-
-// `n` with the entry in slot `off` rebound to `e`. A rebind leaves the shape alone.
+// The two in-place rewrites, each paired with the copy it falls back to. Returning `n` itself says
+// the write happened in place. Inlined like `Rebuilt`, `WithChild` the more urgently: it runs once
+// per level of a path copy.
 [[gnu::always_inline]] const Node *WithEntry(const Node *n, uint32_t off, Entry e, bool owned) {
     if (!owned) return Rebuilt(n, n->Datamap, n->Nodemap, {off, true, &e}, {});
     Entries(Mutable(n))[off] = e;
     return n;
 }
 
-// `n` with the child in slot `off`, currently `old`, replaced by `updated`.
 [[gnu::always_inline]] const Node *WithChild(const Node *n, uint32_t off, const Node *old, const Node *updated, bool owned) {
     if (updated == old) return n;
     if (!owned) return Rebuilt(n, n->Datamap, n->Nodemap, {}, {off, true, &updated});
-    Children(Mutable(n))[off] = updated; // The slot is ours to repoint, and `old` loses its last name here.
+    Children(Mutable(n))[off] = updated;
     Release(old);
     return n;
 }
@@ -233,8 +196,8 @@ struct SetResult {
     bool Added;
 };
 
-// `owned` means every node from the root down to `n` is named exactly once, so no other map can
-// see `n` and rewriting it in place is unobservable. See `WithEntry` and `WithChild` above.
+// `owned` means every node from the root down to `n` is named exactly once, so no other map can see
+// a write and rewriting in place is unobservable. Returning `n` leaves the path above it untouched.
 SetResult DoSet(const Node *n, Entry e, uint64_t hash, uint32_t shift, bool owned) {
     const Bitmap bit = Bitmap{1} << Idx(hash, shift);
     if (n->Datamap & bit) {
@@ -255,7 +218,7 @@ SetResult DoSet(const Node *n, Entry e, uint64_t hash, uint32_t shift, bool owne
 enum class EraseStatus {
     NotFound,
     Replaced, // `Replacement` stands in for this node.
-    Singleton, // This node held only `Lone`, which the parent must absorb.
+    Singleton, // This node is down to `Lone`, which belongs inlined a level up.
     Empty, // The whole map is gone. Only the root can report this.
 };
 
@@ -271,14 +234,13 @@ EraseResult DoErase(const Node *n, uint64_t key, uint64_t hash, uint32_t shift, 
         const auto off = DataOffset(*n, bit);
         if (Entries(n)[off].Key != key) return {EraseStatus::NotFound};
         const auto dc = DataCount(*n);
-        // A node with a child, or with entries to spare, has enough left to stand on its own.
+        // A node with a child, or entries to spare, stands on its own. Otherwise the lone survivor
+        // belongs inlined in the parent -- except at the root, which has nowhere to hand it.
         if (n->Nodemap || dc > 2) return {EraseStatus::Replaced, WithEntryRemoved(n, bit)};
-        // Otherwise a lone survivor is all that would be left, and that belongs inlined in the parent.
         if (shift > 0) {
             assert(dc == 2); // Below the root, one entry and no children would have collapsed.
             return {EraseStatus::Singleton, nullptr, Entries(n)[off ^ 1]};
         }
-        // The root has no parent to hand it to, so it keeps the survivor -- or, with none, the map is gone.
         if (dc == 1) return {EraseStatus::Empty};
         return {EraseStatus::Replaced, WithEntryRemoved(n, bit)};
     }
@@ -308,13 +270,11 @@ bool SameNodes(const Node *a, const Node *b) {
     return true;
 }
 
-// `prefix` is the low `shift` hash bits the path down to `n` has already fixed, and `count`
-// accumulates the entries found. Confirms every entry and child sits in the slot its hash selects,
-// and that no node is empty or collapsible -- the two ways shape could stop being a function of contents.
+// `prefix` is the low `shift` hash bits the path down to `n` has already fixed. Confirms every entry
+// and child sits in the slot its hash selects, and that no node is empty or collapsible.
 bool CheckNode(const Node *n, uint32_t shift, uint64_t prefix, uint64_t &count) {
     if (n->Datamap & n->Nodemap) return false; // A slot holds an entry or a child, never both.
-    // Checked before anything reads an entry, because the cached count is what places the entries:
-    // a stale one moves the whole entry array and everything below would be looking at the wrong bytes.
+    // Before anything reads an entry: the cached count is what places the entry array.
     if (n->Children != uint32_t(std::popcount(n->Nodemap))) return false;
     const auto dc = DataCount(*n), nc = ChildCount(*n);
     if (dc + nc == 0) return false; // Empty nodes are never built, not even at the root.
@@ -334,7 +294,6 @@ bool CheckNode(const Node *n, uint32_t shift, uint64_t prefix, uint64_t &count) 
     return true;
 }
 
-// Points `it` at `n`'s entries and queues `n`'s children behind them.
 void Descend(Iterator &it, const Node *n) {
     it.Cur = Entries(n);
     it.End = it.Cur + DataCount(*n);
@@ -365,8 +324,7 @@ Map Set(Map m, uint64_t key, uint64_t value) {
         return {n, 1};
     }
     const auto r = DoSet(m.Root, e, hash, 0, m.Root->Refs == 1);
-    // A root rewritten in place is still the one `m` holds, so hand that reference on rather than
-    // claiming a second one against it.
+    // A root rewritten in place is still the one `m` holds, so hand that reference on.
     if (r.Root == m.Root) {
         m.Size += r.Added;
         return m;
@@ -407,8 +365,7 @@ std::optional<uint64_t> Get(const Map &m, uint64_t key) {
 bool operator==(const Map &a, const Map &b) {
     if (a.Root == b.Root) return true; // Two empty maps, or two that share a root outright.
     if (!a.Root || !b.Root) return false; // Only an empty map has a null root, so one of them is empty.
-    // The size test is an early out and nothing more. Equal contents in a canonical trie means equal
-    // structure, so `SameNodes` would reject a size mismatch on its own, just after walking for it.
+    // The size test is an early out and nothing more: `SameNodes` would reject a mismatch anyway.
     return a.Size == b.Size && SameNodes(a.Root, b.Root);
 }
 
