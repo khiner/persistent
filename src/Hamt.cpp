@@ -4,18 +4,24 @@
 #include <cassert>
 #include <cstdlib>
 #include <cstring>
+#include <type_traits>
 #include <utility>
+
+// Branching factor exponent, so 32 slots per node at 5 and 64 at 6. Set from CMake to sweep it.
+#ifndef HAMT_BITS
+#define HAMT_BITS 5
+#endif
 
 namespace hamt {
 namespace {
-constexpr uint32_t Bits = 5, Mask = (1u << Bits) - 1;
+constexpr uint32_t Bits = HAMT_BITS;
+static_assert(Bits == 5 || Bits == 6, "A slot map has to be exactly one machine word wide");
 
-struct Entry {
-    uint64_t Key, Value;
-};
+using Bitmap = std::conditional_t<Bits == 6, uint64_t, uint32_t>;
+constexpr Bitmap Mask = (Bitmap{1} << Bits) - 1;
 
 // splitmix64's finalizer. It is a bijection on uint64, so distinct keys never share a hash,
-// and 13 levels of 5 bits cover all 64 hash bits -- any two keys separate before the trie
+// and the levels between them consume all 64 hash bits -- any two keys separate before the trie
 // bottoms out. That is why there are no collision nodes here.
 // Mixing is not what buys that (identity would too). It buys a shape that does not depend on
 // the key distribution, so pointer-like keys with zeroed low bits stay shallow.
@@ -26,8 +32,10 @@ constexpr uint64_t Hash(uint64_t x) {
     return x ^ (x >> 31);
 }
 
-constexpr uint32_t Idx(uint64_t hash, uint32_t shift) { return (hash >> shift) & Mask; }
+constexpr uint32_t Idx(uint64_t hash, uint32_t shift) { return static_cast<uint32_t>((hash >> shift) & Mask); }
 } // namespace
+
+static_assert(Iterator::MaxDepth >= (64 + Bits - 1) / Bits, "The iterator stack has to hold a whole path");
 
 // A CHAMP node. `Datamap` marks the slots holding an inline entry, `Nodemap` the slots holding a
 // child, and no slot is in both. Entries and children trail the header in that order, each packed
@@ -36,14 +44,14 @@ constexpr uint32_t Idx(uint64_t hash, uint32_t shift) { return (hash >> shift) &
 // threads is not supported, and rpds measures the atomic version at up to 2x on this traffic.
 struct alignas(8) Node {
     mutable uint32_t Refs;
-    uint32_t Datamap, Nodemap;
+    Bitmap Datamap, Nodemap;
 };
 
 namespace {
 uint32_t DataCount(const Node &n) { return std::popcount(n.Datamap); }
 uint32_t ChildCount(const Node &n) { return std::popcount(n.Nodemap); }
-uint32_t DataOffset(const Node &n, uint32_t bit) { return std::popcount(n.Datamap & (bit - 1)); }
-uint32_t ChildOffset(const Node &n, uint32_t bit) { return std::popcount(n.Nodemap & (bit - 1)); }
+uint32_t DataOffset(const Node &n, Bitmap bit) { return std::popcount(n.Datamap & (bit - 1)); }
+uint32_t ChildOffset(const Node &n, Bitmap bit) { return std::popcount(n.Nodemap & (bit - 1)); }
 
 Entry *Entries(Node *n) { return reinterpret_cast<Entry *>(n + 1); }
 const Entry *Entries(const Node *n) { return reinterpret_cast<const Entry *>(n + 1); }
@@ -73,7 +81,7 @@ void CloneChildren(const Node **dst, const Node *const *src, uint32_t n) {
 }
 
 // The returned node carries the one reference its caller is expected to hand on.
-Node *Alloc(uint32_t datamap, uint32_t nodemap) {
+Node *Alloc(Bitmap datamap, Bitmap nodemap) {
     auto *n = static_cast<Node *>(std::malloc(sizeof(Node) + std::popcount(datamap) * sizeof(Entry) + std::popcount(nodemap) * sizeof(const Node *)));
     n->Refs = 1;
     n->Datamap = datamap;
@@ -99,7 +107,7 @@ Node *WithChildReplaced(const Node *n, uint32_t off, const Node *child) {
     return c;
 }
 
-Node *WithEntryInserted(const Node *n, uint32_t bit, Entry e) {
+Node *WithEntryInserted(const Node *n, Bitmap bit, Entry e) {
     const auto dc = DataCount(*n), off = DataOffset(*n, bit);
     auto *c = Alloc(n->Datamap | bit, n->Nodemap);
     auto *es = Entries(c);
@@ -110,7 +118,7 @@ Node *WithEntryInserted(const Node *n, uint32_t bit, Entry e) {
     return c;
 }
 
-Node *WithEntryRemoved(const Node *n, uint32_t bit) {
+Node *WithEntryRemoved(const Node *n, Bitmap bit) {
     const auto dc = DataCount(*n), off = DataOffset(*n, bit);
     auto *c = Alloc(n->Datamap ^ bit, n->Nodemap);
     auto *es = Entries(c);
@@ -121,7 +129,7 @@ Node *WithEntryRemoved(const Node *n, uint32_t bit) {
 }
 
 // The slot moves from the entry side to the child side, for when two keys collide on it.
-Node *WithEntryPromoted(const Node *n, uint32_t bit, const Node *child) {
+Node *WithEntryPromoted(const Node *n, Bitmap bit, const Node *child) {
     const auto dc = DataCount(*n), nc = ChildCount(*n);
     const auto doff = DataOffset(*n, bit), coff = ChildOffset(*n, bit);
     auto *c = Alloc(n->Datamap ^ bit, n->Nodemap | bit);
@@ -137,7 +145,7 @@ Node *WithEntryPromoted(const Node *n, uint32_t bit, const Node *child) {
 
 // The reverse: a child that has collapsed to its last entry folds back into the entry side.
 // This is what keeps the trie canonical, so shape is a function of contents alone.
-Node *WithChildInlined(const Node *n, uint32_t bit, Entry e) {
+Node *WithChildInlined(const Node *n, Bitmap bit, Entry e) {
     const auto dc = DataCount(*n), nc = ChildCount(*n);
     const auto doff = DataOffset(*n, bit), coff = ChildOffset(*n, bit);
     auto *c = Alloc(n->Datamap | bit, n->Nodemap ^ bit);
@@ -156,11 +164,11 @@ const Node *Merged(Entry a, uint64_t ha, Entry b, uint64_t hb, uint32_t shift) {
     assert(shift < 64); // Distinct hashes always diverge before this.
     const auto ia = Idx(ha, shift), ib = Idx(hb, shift);
     if (ia == ib) {
-        auto *n = Alloc(0, 1u << ia);
+        auto *n = Alloc(0, Bitmap{1} << ia);
         Children(n)[0] = Merged(a, ha, b, hb, shift + Bits);
         return n;
     }
-    auto *n = Alloc((1u << ia) | (1u << ib), 0);
+    auto *n = Alloc((Bitmap{1} << ia) | (Bitmap{1} << ib), 0);
     auto *es = Entries(n);
     es[ia < ib ? 0 : 1] = a;
     es[ia < ib ? 1 : 0] = b;
@@ -176,7 +184,7 @@ struct SetResult {
 // see `n` and rewriting it in place is unobservable. Returning `n` itself says that is what happened,
 // which lets the whole path above it stay untouched.
 SetResult DoSet(const Node *n, Entry e, uint64_t hash, uint32_t shift, bool owned) {
-    const uint32_t bit = 1u << Idx(hash, shift);
+    const Bitmap bit = Bitmap{1} << Idx(hash, shift);
     if (n->Datamap & bit) {
         const auto off = DataOffset(*n, bit);
         const auto old = Entries(n)[off];
@@ -220,7 +228,7 @@ struct EraseResult {
 };
 
 EraseResult DoErase(const Node *n, uint64_t key, uint64_t hash, uint32_t shift, bool owned) {
-    const uint32_t bit = 1u << Idx(hash, shift);
+    const Bitmap bit = Bitmap{1} << Idx(hash, shift);
     if (n->Datamap & bit) {
         const auto off = DataOffset(*n, bit);
         if (Entries(n)[off].Key != key) return {EraseStatus::NotFound};
@@ -257,6 +265,50 @@ EraseResult DoErase(const Node *n, uint64_t key, uint64_t hash, uint32_t shift, 
     assert(r.Status == EraseStatus::NotFound); // A child collapses to a singleton, never to empty.
     return {EraseStatus::NotFound};
 }
+
+bool SameNodes(const Node *a, const Node *b) {
+    if (a == b) return true; // Structure the two maps share settles a whole subtrie at once.
+    if (a->Datamap != b->Datamap || a->Nodemap != b->Nodemap) return false;
+    // A slot's position is fixed by the bitmap, so equal nodes hold their entries in the same order.
+    if (std::memcmp(Entries(a), Entries(b), DataCount(*a) * sizeof(Entry)) != 0) return false;
+    const auto *const *ca = Children(a);
+    const auto *const *cb = Children(b);
+    for (uint32_t i = 0, nc = ChildCount(*a); i < nc; ++i)
+        if (!SameNodes(ca[i], cb[i])) return false;
+    return true;
+}
+
+// `prefix` is the hash bits the path down to `n` has already fixed, and `count`
+// accumulates the entries found. Confirms every entry and child sits in the slot its hash selects,
+// and that no node is empty or collapsible -- the two ways shape could stop being a function of contents.
+bool CheckNode(const Node *n, uint32_t shift, uint64_t prefix, uint64_t &count) {
+    if (n->Datamap & n->Nodemap) return false; // A slot holds an entry or a child, never both.
+    const auto dc = DataCount(*n), nc = ChildCount(*n);
+    if (dc + nc == 0) return false; // Empty nodes are never built, not even at the root.
+    if (shift > 0 && nc == 0 && dc == 1) return false; // A lone entry belongs inlined in the parent.
+    const uint64_t prefix_mask = (uint64_t{1} << shift) - 1;
+    count += dc;
+    auto dm = n->Datamap;
+    for (uint32_t i = 0; dm; dm &= dm - 1, ++i) {
+        const auto hash = Hash(Entries(n)[i].Key);
+        if ((hash & prefix_mask) != prefix) return false;
+        if (Idx(hash, shift) != uint32_t(std::countr_zero(dm))) return false;
+    }
+    auto nm = n->Nodemap;
+    for (uint32_t i = 0; nm; nm &= nm - 1, ++i) {
+        const auto slot = uint64_t(std::countr_zero(nm));
+        if (!CheckNode(Children(n)[i], shift + Bits, prefix | (slot << shift), count)) return false;
+    }
+    return true;
+}
+
+// Points `it` at `n`'s entries and queues `n`'s children behind them.
+void Descend(Iterator &it, const Node *n) {
+    it.Cur = Entries(n);
+    it.End = it.Cur + DataCount(*n);
+    const auto *const *cs = Children(n);
+    it.Stack[it.Depth++] = {cs, cs + ChildCount(*n)};
+}
 } // namespace
 
 Map::Map(const Map &o) : Root(o.Root), Size(o.Size) {
@@ -279,7 +331,7 @@ Map Set(Map m, uint64_t key, uint64_t value) {
     const Entry e{key, value};
     const auto hash = Hash(key);
     if (!m.Root) {
-        auto *n = Alloc(1u << Idx(hash, 0), 0);
+        auto *n = Alloc(Bitmap{1} << Idx(hash, 0), 0);
         Entries(n)[0] = e;
         return {n, 1};
     }
@@ -312,7 +364,7 @@ std::optional<uint64_t> Get(const Map &m, uint64_t key) {
     const auto hash = Hash(key);
     uint32_t shift = 0;
     for (const auto *n = m.Root; n; shift += Bits) {
-        const uint32_t bit = 1u << Idx(hash, shift);
+        const Bitmap bit = Bitmap{1} << Idx(hash, shift);
         if (n->Datamap & bit) {
             const auto &e = Entries(n)[DataOffset(*n, bit)];
             return e.Key == key ? std::optional{e.Value} : std::nullopt;
@@ -321,5 +373,38 @@ std::optional<uint64_t> Get(const Map &m, uint64_t key) {
         n = Children(n)[ChildOffset(*n, bit)];
     }
     return {};
+}
+
+bool operator==(const Map &a, const Map &b) {
+    if (a.Root == b.Root) return true;
+    // Only an empty map has a null root, and that case just went by, so both roots are real here.
+    return a.Size == b.Size && SameNodes(a.Root, b.Root);
+}
+
+bool Check(const Map &m) {
+    if (!m.Root) return m.Size == 0;
+    uint64_t count = 0;
+    return CheckNode(m.Root, 0, 0, count) && count == m.Size;
+}
+
+void Iterator::Advance() {
+    while (Depth) {
+        auto &frame = Stack[Depth - 1];
+        if (frame.Child == frame.ChildEnd) {
+            --Depth;
+            continue;
+        }
+        Descend(*this, *frame.Child++);
+        if (Cur != End) return;
+    }
+    Cur = End = nullptr;
+}
+
+Iterator begin(const Map &m) {
+    Iterator it{};
+    if (!m.Root) return it;
+    Descend(it, m.Root);
+    if (it.Cur == it.End) it.Advance(); // A root holding only children has nothing to yield yet.
+    return it;
 }
 } // namespace hamt

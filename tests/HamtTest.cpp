@@ -12,8 +12,36 @@
 #include <immer/map.hpp>
 #pragma clang diagnostic pop
 
+#include <algorithm>
 #include <random>
 #include <utility>
+#include <vector>
+
+// Ahead of `using namespace boost::ut`, so that `==` here is the vector's and not ut's expression builder.
+namespace {
+using Bindings = std::vector<std::pair<uint64_t, uint64_t>>;
+
+// Iteration order is unspecified, so contents are compared as sorted key/value lists.
+Bindings Sorted(Bindings v) {
+    std::sort(v.begin(), v.end());
+    return v;
+}
+
+Bindings Sorted(const hamt::Map &m) {
+    Bindings v;
+    for (const auto &e : m) v.emplace_back(e.Key, e.Value);
+    return Sorted(std::move(v));
+}
+
+Bindings Sorted(const immer::map<uint64_t, uint64_t> &m) {
+    Bindings v;
+    for (const auto &[key, value] : m) v.emplace_back(key, value);
+    return Sorted(std::move(v));
+}
+
+// The map iterates exactly the bindings `expected` holds.
+template<typename T> bool Iterates(const hamt::Map &m, const T &expected) { return Sorted(m) == Sorted(expected); }
+} // namespace
 
 using namespace boost::ut;
 
@@ -63,6 +91,57 @@ int main() {
         expect(hamt::Get(erased, 1) == std::optional<uint64_t>{100});
     };
 
+    "iterate"_test = [] {
+        const hamt::Map empty{};
+        expect(hamt::begin(empty) == hamt::end(empty));
+
+        hamt::Map m{};
+        Bindings expected;
+        for (uint64_t i = 0; i < 1'000; ++i) {
+            m = hamt::Set(std::move(m), i * i, i);
+            expected.emplace_back(i * i, i);
+        }
+        expect(Iterates(m, expected));
+    };
+
+    "equality"_test = [] {
+        // Built in opposite orders, so the two share nothing and have to agree structurally.
+        hamt::Map forward{}, backward{};
+        for (uint64_t i = 0; i < 1'000; ++i) forward = hamt::Set(std::move(forward), i * 7, i);
+        for (uint64_t i = 1'000; i-- > 0;) backward = hamt::Set(std::move(backward), i * 7, i);
+        expect(forward == backward);
+        expect(hamt::Map{} == hamt::Map{});
+        expect(!(forward == hamt::Map{}));
+        expect(!(forward == hamt::Set(forward, 1, 1))); // An extra binding.
+        expect(!(forward == hamt::Set(forward, 0, 1))); // Same keys, one value changed.
+        expect(hamt::Erase(hamt::Set(forward, 1, 1), 1) == forward); // Round trip back to canonical.
+    };
+
+    "full depth"_test = [] {
+        // Keys whose hashes come out consecutive, so they agree on every level but the last and drive
+        // the trie to its full depth -- a path random keys never take. The step is the multiplicative
+        // inverse of the hash constant, so stepping the key by it steps the hash by one.
+        constexpr uint64_t Step = 0xf1de83e19937733dull;
+        constexpr uint64_t N = 8;
+        hamt::Map m{};
+        Bindings expected;
+        for (uint64_t i = 0; i < N; ++i) {
+            m = hamt::Set(std::move(m), i * Step, i);
+            expected.emplace_back(i * Step, i);
+            expect(hamt::Check(m) >> fatal) << "after inserting" << i;
+        }
+        expect(m.Size == N);
+        expect(Iterates(m, expected));
+        for (uint64_t i = 0; i < N; ++i) expect(hamt::Get(m, i * Step) == std::optional{i});
+
+        // Erasing back down unwinds the whole chain, one collapsed level at a time.
+        for (uint64_t i = 0; i < N; ++i) {
+            m = hamt::Erase(std::move(m), i * Step);
+            expect(hamt::Check(m) >> fatal) << "after erasing" << i;
+        }
+        expect(m.Size == 0_u64);
+    };
+
     "immer parity"_test = [] {
         // Random sets and erases over a small key range, so overwrites, misses, and collisions all occur.
         std::mt19937_64 rng{42};
@@ -84,7 +163,24 @@ int main() {
             expect((actual == (expected ? std::optional{*expected} : std::nullopt)) >> fatal) << "key" << key << "after op" << i;
         }
         expect(ours.Size == uint64_t{theirs.size()});
-        for (const auto &[key, value] : theirs) expect((hamt::Get(ours, key) == std::optional{value}) >> fatal) << "key" << key;
+        expect(hamt::Check(ours));
+        expect(Iterates(ours, theirs));
+    };
+
+    "canonical form"_test = [] {
+        // A key range small enough that the same contents are reached over and over by different routes.
+        // Canonicality says every route ends at the same trie, so the invariant holds after every step.
+        std::mt19937_64 rng{11};
+        std::uniform_int_distribution<uint64_t> key_dist{0, 64};
+        hamt::Map ours{};
+        for (uint64_t i = 0; i < 5'000; ++i) {
+            const auto key = key_dist(rng);
+            ours = rng() % 2 ? hamt::Set(std::move(ours), key, i) : hamt::Erase(std::move(ours), key);
+            expect(hamt::Check(ours) >> fatal) << "after op" << i;
+        }
+        auto miscounted = ours; // The check has to be able to fail, so hand it something it should reject.
+        ++miscounted.Size;
+        expect(!hamt::Check(miscounted));
     };
 
     "in-place reuse"_test = [] {
@@ -113,10 +209,9 @@ int main() {
                 theirs = theirs.set(key, i);
             }
         }
-        expect(ours.Size == uint64_t{theirs.size()});
-        for (const auto &[key, value] : theirs) expect((hamt::Get(ours, key) == std::optional{value}) >> fatal) << "key" << key;
-
-        expect(ours_snapshot.Size == uint64_t{theirs_snapshot.size()});
-        for (const auto &[key, value] : theirs_snapshot) expect((hamt::Get(ours_snapshot, key) == std::optional{value}) >> fatal) << "snapshot key" << key;
+        expect(hamt::Check(ours));
+        expect(Iterates(ours, theirs));
+        expect(hamt::Check(ours_snapshot));
+        expect(Iterates(ours_snapshot, theirs_snapshot));
     };
 }
