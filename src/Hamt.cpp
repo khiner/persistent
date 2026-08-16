@@ -91,17 +91,20 @@ static_assert(SlabBytes > SizeClasses * 8, "A slab has to hold at least one node
 
 // A slab is aligned to its own size, so clearing the low bits of a node's address finds the slab it
 // came from and a release needs no lookup. One slab serves one size, and allocation stays on a single
-// slab until it is full.
-struct Slab {
+// slab until it is full. The header is 16-byte aligned and a whole number of pairs of words wide, so
+// the nodes cut behind it keep the alignment the slab itself has.
+struct alignas(16) Slab {
     Slab *Next; // The next slab of this size with room in it.
+    Slab *All; // Every slab ever taken, so the footprint can be totted up.
     const Node *Free; // Nodes released back into this slab, linked through their dead headers.
     uint32_t Bump; // How far allocation has cut into it.
     uint32_t Bytes; // The node size it serves.
     uint32_t Live; // Nodes it has handed out and not had back.
     bool Listed; // A full slab leaves the list until a release puts something back.
 };
+static_assert(sizeof(Slab) % 16 == 0, "The first node behind the header has to stay 16-byte aligned");
 
-Slab *Partial[SizeClasses]{};
+Slab *Partial[SizeClasses]{}, *AllSlabs = nullptr;
 
 Slab *SlabOf(const Node *n) { return reinterpret_cast<Slab *>(reinterpret_cast<uintptr_t>(n) & ~uintptr_t(SlabBytes - 1)); }
 #endif
@@ -179,8 +182,8 @@ Node *Alloc(Bitmap datamap, Bitmap nodemap) {
     auto *slab = Partial[words];
     if (!slab) {
         slab = static_cast<Slab *>(std::aligned_alloc(SlabBytes, SlabBytes));
-        *slab = {nullptr, nullptr, uint32_t(sizeof(Slab)), bytes, 0, true};
-        Partial[words] = slab;
+        *slab = {nullptr, AllSlabs, nullptr, uint32_t(sizeof(Slab)), bytes, 0, true};
+        Partial[words] = AllSlabs = slab;
     }
     ++slab->Live;
     if (slab->Free) {
@@ -303,14 +306,11 @@ EraseResult DoErase(const Node *n, uint64_t key, uint64_t hash, uint32_t shift, 
         if (Entries(n)[off].Key != key) return {EraseStatus::NotFound};
         const auto dc = DataCount(*n);
         // A node with a child, or entries to spare, stands on its own. Otherwise the lone survivor
-        // belongs inlined in the parent -- except at the root, which has nowhere to hand it.
+        // belongs inlined in the parent, or is the whole map when there is no parent.
         if (n->Nodemap || dc > 2) return {EraseStatus::Replaced, WithEntryRemoved(n, bit)};
-        if (shift > 0) {
-            assert(dc == 2); // Below the root, one entry and no children would have collapsed.
-            return {EraseStatus::Singleton, nullptr, Entries(n)[off ^ 1]};
-        }
-        if (dc == 1) return {EraseStatus::Empty};
-        return {EraseStatus::Replaced, WithEntryRemoved(n, bit)};
+        if (dc == 1) return {EraseStatus::Empty}; // Only a root, since one entry alone collapses.
+        assert(dc == 2);
+        return {EraseStatus::Singleton, nullptr, Entries(n)[off ^ 1]};
     }
     if (!(n->Nodemap & bit)) return {EraseStatus::NotFound};
     const auto off = ChildOffset(*n, bit);
@@ -318,8 +318,9 @@ EraseResult DoErase(const Node *n, uint64_t key, uint64_t hash, uint32_t shift, 
     const auto r = DoErase(child, key, hash, shift + Bits, owned && child->Refs == 1);
     if (r.Status == EraseStatus::Replaced) return {EraseStatus::Replaced, WithChild(n, off, child, r.Replacement, owned)};
     if (r.Status == EraseStatus::Singleton) {
-        // Keep passing it up while this node has nothing of its own to hold it.
-        if (!n->Datamap && ChildCount(*n) == 1 && shift > 0) return r;
+        // Keep passing it up while this node has nothing of its own to hold it. The root always has
+        // two slots taken, so it is never the one passing.
+        if (!n->Datamap && ChildCount(*n) == 1) return r;
         return {EraseStatus::Replaced, WithChildInlined(n, bit, r.Lone)};
     }
     assert(r.Status == EraseStatus::NotFound); // A child collapses to a singleton, never to empty.
@@ -374,48 +375,88 @@ void Descend(Iterator &it, const Node *n) {
 }
 } // namespace
 
-Map::Map(const Map &o) : Root(o.Root), Size(o.Size) {
+Map::Map(const Map &o) : Root(o.Root), Shift(o.Shift), Prefix(o.Prefix), Size(o.Size) {
     if (Root) Retain(Root);
 }
-Map::Map(Map &&o) noexcept : Root(std::exchange(o.Root, nullptr)), Size(std::exchange(o.Size, 0)) {}
+Map::Map(Map &&o) noexcept : Root(std::exchange(o.Root, nullptr)), Shift(std::exchange(o.Shift, 0)), Prefix(std::exchange(o.Prefix, 0)), Size(std::exchange(o.Size, 0)) {}
 Map::~Map() {
     if (Root) Release(Root);
 }
 Map &Map::operator=(Map o) {
     std::swap(Root, o.Root);
+    std::swap(Shift, o.Shift);
+    std::swap(Prefix, o.Prefix);
     std::swap(Size, o.Size);
     return *this;
 }
 
+namespace {
+// The one entry a map is down to, as a map. Its root sits at shift zero, since a single key agrees
+// with itself everywhere and the skipped bits would have nothing to say.
+Map Lone(Entry e) {
+    auto *n = Alloc(Bitmap{1} << Idx(Hash(e.Key), 0), 0);
+    Entries(n)[0] = e;
+    return {n, 1, 0, 0};
+}
+
+// Drops every root that has one child and no entries, recording the bits it stood for. What makes it
+// canonical is that the level a map's keys first diverge at is a function of the keys.
+void Compress(Map &m) {
+    while (!m.Root->Datamap && ChildCount(*m.Root) == 1) {
+        const auto *child = Children(m.Root)[0];
+        Retain(child); // Claimed before the root goes, since the root is what holds it.
+        m.Prefix |= uint64_t(std::countr_zero(m.Root->Nodemap)) << m.Shift;
+        m.Shift += Bits;
+        Release(m.Root);
+        m.Root = child;
+    }
+}
+
+// The map with `e` beside it, for a key that diverges from the prefix the root skips. Everything
+// below `shift` agrees, so the levels between there and the old root become nodes at last: a walk
+// coming down through the new branch has to be told the way.
+Map Grown(Map m, Entry e, uint64_t hash, uint32_t shift) {
+    const auto *chain = std::exchange(m.Root, nullptr); // Its reference passes to the node above it.
+    for (auto s = m.Shift - Bits; s > shift; s -= Bits) {
+        auto *n = Alloc(0, Bitmap{1} << Idx(m.Prefix, s));
+        Children(n)[0] = chain;
+        chain = n;
+    }
+    auto *root = Alloc(Bitmap{1} << Idx(hash, shift), Bitmap{1} << Idx(m.Prefix, shift));
+    Entries(root)[0] = e;
+    Children(root)[0] = chain;
+    return {root, m.Size + 1, m.Prefix & ((uint64_t{1} << shift) - 1), shift};
+}
+} // namespace
+
 Map Set(Map m, uint64_t key, uint64_t value) {
     const Entry e{key, value};
     const auto hash = Hash(key);
-    if (!m.Root) {
-        auto *n = Alloc(Bitmap{1} << Idx(hash, 0), 0);
-        Entries(n)[0] = e;
-        return {n, 1};
-    }
-    const auto r = DoSet(m.Root, e, hash, 0, m.Root->Refs == 1);
+    if (!m.Root) return Lone(e);
+    // A key that disagrees over the bits the root skips belongs above the root, not under it.
+    if (const auto diff = (hash ^ m.Prefix) & ((uint64_t{1} << m.Shift) - 1)) return Grown(std::move(m), e, hash, uint32_t(std::countr_zero(diff)) / Bits * Bits);
+    const auto r = DoSet(m.Root, e, hash, m.Shift, m.Root->Refs == 1);
     // A root rewritten in place is still the one `m` holds, so hand that reference on.
-    if (r.Root == m.Root) {
-        m.Size += r.Added;
-        return m;
-    }
-    return {r.Root, m.Size + r.Added};
+    Map out = r.Root == m.Root ? std::move(m) : Map{r.Root, m.Size, m.Prefix, m.Shift};
+    out.Size += r.Added;
+    // Promoting the entry of a map that held only one leaves a root with a single child, and the
+    // subtrie under it is a chain until the two keys diverge. Nothing else here can build one.
+    if (out.Size == 2) Compress(out);
+    return out;
 }
 
 Map Erase(Map m, uint64_t key) {
     if (!m.Root) return m;
-    const auto r = DoErase(m.Root, key, Hash(key), 0, m.Root->Refs == 1);
+    const auto r = DoErase(m.Root, key, Hash(key), m.Shift, m.Root->Refs == 1);
     if (r.Status == EraseStatus::Replaced) {
-        if (r.Replacement == m.Root) {
-            --m.Size;
-            return m;
-        }
-        return {r.Replacement, m.Size - 1};
+        Map out = r.Replacement == m.Root ? std::move(m) : Map{r.Replacement, m.Size, m.Prefix, m.Shift};
+        --out.Size;
+        Compress(out); // A root down to its last child skips the level it stood on.
+        return out;
     }
     if (r.Status == EraseStatus::Empty) return {};
-    assert(r.Status == EraseStatus::NotFound); // Singletons never escape the root.
+    if (r.Status == EraseStatus::Singleton) return Lone(r.Lone); // Only the root reports one, and only from two entries.
+    assert(r.Status == EraseStatus::NotFound);
     return m;
 }
 
@@ -426,7 +467,9 @@ const uint64_t *Get(const Map &m, uint64_t key) {
     // loop has no condition because a slot holding a child is never null, so the walk ends by
     // returning. The child map is tested first because most levels descend, and the maps are disjoint,
     // so either order is correct.
-    for (auto hash = Hash(key);; hash >>= Bits) {
+    // A key that disagrees over the bits the root skips needs no test of its own: every key in the
+    // map agrees on them, the fold is a bijection, so whatever the walk lands on is a different key.
+    for (auto hash = Hash(key) >> m.Shift;; hash >>= Bits) {
         const Bitmap bit = Bitmap{1} << (hash & Mask);
         if (n->Nodemap & bit) {
             n = Children(n)[ChildOffset(*n, bit)];
@@ -446,9 +489,13 @@ bool operator==(const Map &a, const Map &b) {
 }
 
 bool Check(const Map &m) {
-    if (!m.Root) return m.Size == 0;
+    if (!m.Root) return m.Size == 0 && m.Shift == 0 && m.Prefix == 0;
+    if (m.Shift >= 64 || m.Shift % Bits) return false; // The root stands on a level boundary.
+    if (m.Prefix >> m.Shift) return false; // It holds the skipped bits and nothing above them.
+    // A root with one child and no entries is a level the map should have skipped instead.
+    if (!m.Root->Datamap && ChildCount(*m.Root) == 1) return false;
     uint64_t count = 0;
-    return CheckNode(m.Root, 0, 0, count) && count == m.Size;
+    return CheckNode(m.Root, m.Shift, m.Prefix, count) && count == m.Size;
 }
 
 std::optional<uint64_t> LiveNodes() {
@@ -456,6 +503,21 @@ std::optional<uint64_t> LiveNodes() {
     return Live;
 #else
     return {};
+#endif
+}
+
+std::optional<Footprint> Held() {
+#ifdef HAMT_AUDIT
+    return {};
+#else
+    Footprint f{};
+    for (const auto *slab = AllSlabs; slab; slab = slab->All) {
+        f.ReservedBytes += SlabBytes;
+        if (!slab->Live) continue;
+        f.LiveBytes += uint64_t(slab->Live) * slab->Bytes;
+        f.SpannedBytes += SlabBytes;
+    }
+    return f;
 #endif
 }
 

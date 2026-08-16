@@ -18,10 +18,15 @@ struct Entry {
 // still race.
 struct Map {
     const Node *Root{};
-    uint64_t Size{};
+    // How many low hash bits the root sits above, and what every key's hash holds in them. A level the
+    // whole map agrees on tells a walk nothing, so the map records it here instead of spending a node
+    // on it. Both are zero unless the keys share low bits, as aligned addresses do.
+    uint32_t Shift{};
+    uint64_t Prefix{}, Size{};
 
     Map() = default;
-    Map(const Node *root, uint64_t size) : Root(root), Size(size) {} // Adopts an existing reference to `root`.
+    // Adopts an existing reference to `root`.
+    Map(const Node *root, uint64_t size, uint64_t prefix, uint32_t shift) : Root(root), Shift(shift), Prefix(prefix), Size(size) {}
     Map(const Map &);
     Map(Map &&) noexcept;
     ~Map();
@@ -50,6 +55,16 @@ bool Check(const Map &m);
 // How many nodes the library is holding, so a test can confirm that maps release what they take.
 // Only an audit build (-DHAMT_AUDIT) keeps it. Empty elsewhere, meaning not counted rather than zero.
 std::optional<uint64_t> LiveNodes();
+
+// The bytes of node that maps still point at, against the bytes of slab those nodes are spread over.
+// A walk reads the first and covers the second, so the gap between them is what a lookup pays for the
+// holes a build leaves behind. `SpannedBytes` counts only slabs still holding something, where
+// `ReservedBytes` is everything the allocator has taken from the system and never given back.
+// Empty in an audit build, which has no slabs.
+struct Footprint {
+    uint64_t LiveBytes, SpannedBytes, ReservedBytes;
+};
+std::optional<Footprint> Held();
 
 // Depth-first walk yielding every entry once. The order is unspecified but depends only on contents,
 // so equal maps iterate identically. An iterator holds the map it walks, so it stays valid however

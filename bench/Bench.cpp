@@ -16,6 +16,7 @@
 
 #include <cctype>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <iterator>
@@ -35,7 +36,14 @@ using ImmerMap = immer::map<uint64_t, uint64_t>;
 // repeats. A thousand lookups take a couple of microseconds, close enough to the clock's own cost that
 // the reading is mostly noise, so the small sizes are only comparable once a round runs for
 // milliseconds.
-constexpr uint32_t Rounds = 9;
+// `HAMT_BENCH_ROUNDS` buys wall clock with steadiness, and the whole sweep costs in proportion. Nine
+// reads a single cell more steadily and is worth setting to read one. It does not make the summary
+// below any steadier, which is what a change is judged on, so three is the default.
+const uint32_t Rounds = [] {
+    const auto *rounds = std::getenv("HAMT_BENCH_ROUNDS");
+    const auto n = rounds ? std::strtoul(rounds, nullptr, 10) : 0;
+    return n ? uint32_t(n) : 3;
+}();
 constexpr double MinRoundNanos = 2e6;
 uint64_t Sink = 0;
 
@@ -94,8 +102,18 @@ ImmerMap ImmerBuilt(const std::vector<uint64_t> &keys) {
     return t.persistent();
 }
 
+// The sweep's verdict, accumulated across every row it prints. One cell's margin moves by a tenth on
+// nothing but where the linker put the code, which rerunning the same binary does not resample, so a
+// single cell is not evidence on its own. The mean over all of them holds to a few tenths of a point,
+// because a layout that costs one cell pays another back, and that is what a change is judged on.
+double LogRatios = 0;
+uint32_t Cells = 0, Behind = 0;
+
 void Row(const char *name, double ours, double immer) {
     std::printf("  %-14s %8.2f %8.2f   %+6.1f%%\n", name, ours, immer, 100 * (immer - ours) / immer);
+    LogRatios += std::log(immer / ours);
+    Behind += ours > immer;
+    ++Cells;
 }
 
 void Run(uint64_t n, Pattern pattern) {
@@ -103,7 +121,13 @@ void Run(uint64_t n, Pattern pattern) {
     const auto ours = Built(keys);
     const auto theirs = ImmerBuilt(keys);
 
-    std::printf("\nn = %llu, %s keys\n  %-14s %8s %8s %9s\n", (unsigned long long)n, PatternNames[int(pattern)], "", "ours", "immer", "ours vs");
+    std::printf("\nn = %llu, %s keys\n", (unsigned long long)n, PatternNames[int(pattern)]);
+    // Only our map is live here, so this is what a walk over it covers. A build grows every node up
+    // through the size classes and frees the smaller one each time, so the holes it leaves are the
+    // difference between the two numbers.
+    if (const auto held = hamt::Held())
+        std::printf("  %-14s %8.2f MB of node spread over %.2f MB of slab, %.0f%% full (%.0f MB reserved)\n", "footprint", held->LiveBytes / 1048576.0, held->SpannedBytes / 1048576.0, 100.0 * double(held->LiveBytes) / double(held->SpannedBytes), held->ReservedBytes / 1048576.0);
+    std::printf("  %-14s %8s %8s %9s\n", "", "ours", "immer", "ours vs");
 
     Row("build copy",
         Time(n, [&] { hamt::Map m{}; for (uint64_t i = 0; i < n; ++i) m = hamt::Set(m, keys[i], i); return m.Size; }),
@@ -142,6 +166,7 @@ int main(int argc, char **argv) {
     //   HamtBench                     the three default sizes on random keys
     //   HamtBench sequential 1000000  one size, one pattern
     //   HamtBench all 100000          every pattern at one size
+    //   HAMT_BENCH_ROUNDS=9 HamtBench all   three times the work, for reading one cell closely
     int arg = 1;
     std::vector<Pattern> patterns{Pattern::Random};
     if (argc > 1 && !std::isdigit(static_cast<unsigned char>(argv[1][0]))) {
@@ -163,5 +188,5 @@ int main(int argc, char **argv) {
             for (const uint64_t n : {uint64_t{1'000}, uint64_t{100'000}, uint64_t{1'000'000}}) Run(n, pattern);
         }
     }
-    std::printf("\n(checksum %llu)\n", (unsigned long long)Sink);
+    std::printf("\n%u cells, %u behind immer, geometric mean %+.1f%%  (checksum %llu)\n", Cells, Behind, 100 * (1 - std::exp(-LogRatios / Cells)), (unsigned long long)Sink);
 }

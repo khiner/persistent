@@ -148,6 +148,38 @@ int main() {
         expect(m.Size == 0_u64);
     };
 
+    "shared low bits"_test = [] {
+        // Keys whose hashes agree over their low bits leave the root standing above the levels they
+        // agree on, as any set of aligned addresses does. A later key that disagrees down there has to
+        // put those levels back, and erasing it has to take them away again.
+        constexpr uint64_t Step = 0x1000100000000000ull; // Hashes varying in bits 12, 28, 44 and 60 only.
+        constexpr uint64_t N = 8;
+        hamt::Map base{};
+        Bindings expected;
+        for (uint64_t i = 1; i <= N; ++i) {
+            base = hamt::Set(std::move(base), i * Step, i);
+            expected.emplace_back(i * Step, i);
+        }
+        expect(hamt::Check(base) >> fatal);
+        expect(base.Shift > 0u) << "twelve shared low bits should have moved the root up";
+        expect(Iterates(base, expected));
+
+        // A key below 2^32 hashes to itself, so each of these diverges at its lowest set bit: one at
+        // the root's own level, one a level under it, and one far enough down to need a chain.
+        for (const uint64_t key : {uint64_t{1} << 11, uint64_t{32}, uint64_t{1}}) {
+            const auto grown = hamt::Set(base, key, key);
+            expect(hamt::Check(grown) >> fatal) << "after inserting" << key;
+            expect(grown.Size == N + 1);
+            expect(Holds(grown, key, key));
+            for (uint64_t i = 1; i <= N; ++i) expect(Holds(grown, i * Step, i));
+            expect(hamt::Get(grown, key + 1) == nullptr);
+
+            const auto back = hamt::Erase(grown, key);
+            expect(hamt::Check(back) >> fatal) << "after erasing" << key;
+            expect(back == base) << "the round trip should land on the same trie";
+        }
+    };
+
     "immer parity"_test = [] {
         // A small key range, so overwrites, misses, and collisions all occur.
         std::mt19937_64 rng{42};
