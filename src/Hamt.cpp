@@ -27,7 +27,7 @@ constexpr Bitmap Mask = (Bitmap{1} << Bits) - 1;
 // One fold and no more: a heap address is dense on a *stride*, and folding bits 16 and up into the low
 // four leaves such a set a permutation of itself yet no longer a lattice -- four times the nodes for
 // the same entries, on the very shape a second fold was meant to protect. Keys whose low bits never
-// vary, which is what it did protect against, go to `Map::Shift`.
+// vary -- the case it did protect against -- go to `Map::Shift`.
 constexpr uint64_t Hash(uint64_t x) { return x ^ (x >> 32); }
 
 constexpr uint32_t Idx(uint64_t hash, uint32_t shift) { return static_cast<uint32_t>((hash >> shift) & Mask); }
@@ -540,7 +540,7 @@ Map WithRoot(Map m, const Node *root) {
 void Compress(Map &m) {
     while (!m.Root->Datamap && ChildCount(*m.Root) == 1) {
         const auto *child = Children(m.Root)[0];
-        Retain(child); // Claimed before the root goes, since the root is what holds it.
+        Retain(child); // Claimed before the root goes, since the root holds the only reference.
         m.Prefix |= uint64_t(std::countr_zero(m.Root->Nodemap)) << m.Shift;
         m.Shift += Bits;
         Release(m.Root);

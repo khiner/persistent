@@ -100,7 +100,7 @@ Checks: >
   cppcoreguidelines-virtual-class-destructor,
   cppcoreguidelines-misleading-capture-default-by-value
 # Only report diagnostics from our own headers, not lib/ or the SDK.
-HeaderFilterRegex: '/MeshEditor/src/'
+HeaderFilterRegex: '/persistent/(src|tests|bench)/'
 WarningsAsErrors: ''
 CheckOptions:
   # Keep the `x ? true : false` style simplifications, but not the DeMorgan rewrites

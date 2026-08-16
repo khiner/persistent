@@ -26,8 +26,8 @@ constexpr double MinRoundNanos = 2e6;
 inline uint64_t Sink = 0;
 
 // Nanoseconds per operation, best of `Rounds`, since timing noise only ever adds. A round repeats until
-// it has run for `MinRoundNanos`, then divides, which is what makes the small sizes comparable: a
-// thousand operations alone are close enough to the clock's own cost to be mostly noise.
+// it has run for `MinRoundNanos`, then divides, so the small sizes stay comparable: a thousand
+// operations alone are close enough to the clock's own cost to be mostly noise.
 template<typename F> double Time(uint64_t ops, F &&f) {
     double best = 1e300;
     for (uint32_t i = 0; i < Rounds; ++i) {

@@ -2,7 +2,7 @@
 // required to agree on every lookup. Both builds are worth running:
 //   cmake --build build --target HamtTest HamtAuditTest
 //   ./build/tests/HamtTest && ./build/tests/HamtAuditTest
-// HamtAuditTest drops the node free list, which is what lets the reclamation check below see anything.
+// HamtAuditTest drops the node free list, so the reclamation check below can see anything at all.
 
 #include "Hamt.h"
 
@@ -72,7 +72,7 @@ std::vector<Change> Diffed(const hamt::Map &a, const hamt::Map &b) {
     return v;
 }
 
-// The same answer reached by looking every key up, which is what the trie walk has to agree with.
+// The same answer reached by looking every key up, which the trie walk has to agree with.
 std::vector<Change> DiffedByHand(const hamt::Map &a, const hamt::Map &b) {
     std::vector<Change> v;
     for (const auto &e : a) {
@@ -168,13 +168,14 @@ int main() {
         expect(twin.Root != ranged.Root) << "built again from scratch, so it shares no node";
         expect(hamt::Map{entries.begin(), entries.begin()}.Size == 0_u64) << "an empty range";
 
-        // Building in one pass has to land on the same trie as inserting one at a time, which is the
-        // whole of canonicality and the only thing that makes the two interchangeable. Each shape
-        // below reaches a different corner.
+        // Building in one pass has to land on the same trie as inserting one at a time: canonicality
+        // is nothing more than that, and nothing else makes the two interchangeable. Each shape below
+        // reaches a different corner.
         constexpr uint64_t Step = 0x1000100000000000ull;
         std::mt19937_64 rng{13};
         const auto keyed = [](uint64_t n, auto key) {
             std::vector<hamt::Entry> v;
+            v.reserve(n);
             for (uint64_t i = 0; i < n; ++i) v.emplace_back(key(i), i);
             return v;
         };
@@ -198,8 +199,8 @@ int main() {
 
     "update"_test = [] {
         const auto inc = [](uint64_t v) { return v + 1; };
-        // A key the map does not hold is updated from zero, which is what immer's default-constructed
-        // value comes to. `UpdateIfExists` leaves the same key alone.
+        // A key the map does not hold is updated from zero, matching immer's default-constructed
+        // value. `UpdateIfExists` leaves the same key alone.
         const auto fresh = hamt::Update({}, 7, inc);
         expect(fresh.Size == 1_u64);
         expect(Holds(fresh, 7, 1));
@@ -267,7 +268,7 @@ int main() {
 
     "full depth"_test = [] {
         // Keys whose hashes differ only in the top four bits, driving the trie to its full depth --
-        // a path random keys never take. The step is what the hash's inverse maps 1 << 60 to.
+        // a path random keys never take. The step is the hash's inverse of 1 << 60.
         constexpr uint64_t Step = 0x1000100000000000ull;
         constexpr uint64_t N = 8;
         hamt::Map m{};
@@ -330,7 +331,7 @@ int main() {
         for (uint64_t i = 0; i < 100'000; ++i) {
             const auto key = key_dist(rng);
             // Both maps update a missing key from a zero of their own: ours by definition, immer's by
-            // default construction. Driving them together is what holds the two definitions to each other.
+            // default construction. Driving them together holds the two definitions to each other.
             const auto bump = [i](uint64_t v) { return v + i; };
             switch (rng() % 4) {
                 case 0:

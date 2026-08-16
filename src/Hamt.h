@@ -36,7 +36,7 @@ struct Map {
     // The map holding every one of `entries`, or all of `[first, last)`, where a repeated key ends up
     // as a repeated `Set` would leave it. Any iterator over something with a `Key` and a `Value` will do.
     Map(std::initializer_list<Entry> entries);
-    template<typename It> Map(It first, It last);
+    template<typename It> Map(It first, const It &last);
 };
 
 // Every write takes the map by value, so move into one when the old map is done with and it will be
@@ -59,7 +59,7 @@ concept EntryRange = std::contiguous_iterator<It> && std::same_as<std::iter_valu
 
 // Out of the struct, since a body written inside the class cannot see `Set`, declared after it. A
 // non-contiguous iterator has to be walked to be read, so that case inserts one at a time.
-template<typename It> Map::Map(It first, It last) {
+template<typename It> Map::Map(It first, const It &last) {
     if constexpr (EntryRange<It>) {
         const Entry *begin = first == last ? nullptr : &*first;
         *this = Build(begin, begin + (last - first));
@@ -106,7 +106,7 @@ bool Check(const Map &m);
 std::optional<uint64_t> LiveNodes();
 
 // The bytes of node maps still point at, against the bytes of slab those nodes are spread over: a walk
-// reads the first and covers the second, so the gap is what a lookup pays for the holes a build leaves.
+// reads the first and covers the second, so a lookup pays the gap for the holes a build leaves.
 // `SpannedBytes` counts only slabs still holding something, `ReservedBytes` all ever taken. Empty in an
 // audit build, which has no slabs.
 struct Footprint {
@@ -140,8 +140,9 @@ struct Iterator {
         const Node *const *Child, *const *ChildEnd;
     };
 
-    // `Cur` is null exactly at the end, which is what `end()` compares equal to. Only frames below
-    // `Depth` are meaningful, so the stack is left uninitialized -- braced init would zero all 13.
+    // `Cur` is null exactly at the end, and comparison against `end()` tests no more than that. Only
+    // frames below `Depth` are meaningful, so the stack is left uninitialized -- braced init would zero
+    // all 13.
     Map Source;
     const Entry *Cur{}, *End{};
     Frame Stack[MaxDepth];

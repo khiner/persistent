@@ -2,7 +2,7 @@
 // operations and required to agree element for element. Both builds are worth running:
 //   cmake --build build --target VectorTest VectorAuditTest
 //   ./build/tests/VectorTest && ./build/tests/VectorAuditTest
-// VectorAuditTest drops the node free list, which is what lets the reclamation check below see anything.
+// VectorAuditTest drops the node free list, so the reclamation check below can see anything at all.
 
 #include "Vector.h"
 
@@ -197,7 +197,7 @@ int main() {
         for (const uint64_t n : {uint64_t{1}, uint64_t{31}, uint64_t{32}, uint64_t{33}, uint64_t{1'024}, uint64_t{40'000}, uint64_t{69'999}}) {
             expect(Holds(vec::Take(deep, n), deep_theirs.take(n)) >> fatal) << "took" << n << "of 70,000";
         }
-        // A cut and then a push, which is what makes the tail the cut left behind have to be a real one.
+        // A cut and then a push, so the tail the cut left behind has to be a real one.
         auto cut = vec::Take(deep, 40'000);
         auto immer_cut = deep_theirs.take(40'000);
         for (uint64_t i = 0; i < 5'000; ++i) {
@@ -215,7 +215,7 @@ int main() {
             // route as well, so the two builds have to agree on the shape and not merely the contents.
             const vec::Vector b{values.begin(), values.end()};
             expect((a == b) >> fatal) << "twins of" << n;
-            // A copy stands on the same nodes, which is the shortcut equality takes before reading any.
+            // A copy stands on the same nodes, the shortcut equality takes before reading any.
             expect((a == vec::Vector{a}) >> fatal) << "itself" << n;
             if (!n) continue;
             expect(!(a == vec::PushBack(a, 0))) << "one longer" << n;
@@ -286,8 +286,8 @@ int main() {
     };
 
     "chunks"_test = [] {
-        // The chunked walk is what the element walks are built on, so its boundaries are worth pinning
-        // down: whole chunks all the way to the tail, and never an empty one.
+        // The element walks are built on the chunked walk, so its boundaries are worth pinning down:
+        // whole chunks all the way to the tail, and never an empty one.
         for (const auto n : Sizes) {
             const auto v = Pushed(Counting(n));
             std::vector<uint64_t> lengths;

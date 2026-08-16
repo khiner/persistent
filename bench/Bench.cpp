@@ -79,7 +79,7 @@ void Run(uint64_t n, Pattern pattern) {
     }
 
     std::printf("\nn = %llu, %s keys\n", (unsigned long long)n, PatternNames[int(pattern)]);
-    // Only our map is live here, so this is what a walk over it covers. A build grows every node up
+    // Only our map is live here, so a walk over it covers exactly this. A build grows every node up
     // through the size classes, freeing the smaller one each time, so the holes it leaves are the gap.
     if (const auto held = hamt::Held())
         std::printf("  %-14s %8.2f MB of node spread over %.2f MB of slab, %.0f%% full (%.0f MB reserved)\n", "footprint", held->LiveBytes / 1048576.0, held->SpannedBytes / 1048576.0, 100.0 * double(held->LiveBytes) / double(held->SpannedBytes), held->ReservedBytes / 1048576.0);
@@ -103,7 +103,7 @@ void Run(uint64_t n, Pattern pattern) {
     Row("lookup miss",
         Time(n, [&] { uint64_t s = 0; for (auto key : absent) s += hamt::Get(ours, key) != nullptr; return s; }),
         Time(n, [&] { uint64_t s = 0; for (auto key : absent) s += theirs.find(key) != nullptr; return s; }));
-    // Both sides move, which is what lets a write rewrite a path in place: ours because `Erase` and
+    // Both sides move, so a write can rewrite a path in place: ours because `Erase` and
     // `Update` take the map by value, immer through its default policy's rvalue overloads. On an lvalue
     // both copy every path -- 2.7x on erase and 2.9x on update, swamping what these rows report.
     Row("erase move",
@@ -128,9 +128,10 @@ void Run(uint64_t n, Pattern pattern) {
         Time(n, [&] { return uint64_t(ours == ours_twin); }),
         Time(n, [&] { return uint64_t(theirs == theirs_twin); }));
 
-    // Diff has two regimes, orders of magnitude apart, so each gets a row. The first is what reconciliation
-    // asks for: a map derived from another by a few writes, where both settle the untouched structure by
-    // pointer. Timed per change reported, since the point is that the size of the map does not enter in.
+    // Diff has two regimes, orders of magnitude apart, so each gets a row. The first measures what
+    // reconciliation asks for: a map derived from another by a few writes, where both settle the
+    // untouched structure by pointer. Timed per change reported, since the size of the map does not
+    // enter in.
     const uint64_t edits = n / 100 ? n / 100 : 1, edit_stride = n / edits;
     auto ours_edited = ours;
     auto theirs_edited = theirs;
