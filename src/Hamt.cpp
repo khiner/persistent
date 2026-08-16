@@ -85,6 +85,8 @@ constexpr uint32_t Words(Bitmap datamap, Bitmap nodemap) {
 uint64_t Live = 0;
 #else
 constexpr uint32_t SizeClasses = Words(~Bitmap{0}, 0) + 1; // All entries, the widest a node gets.
+// Width is linear in the two slot counts, so the widest node is all of one kind or all of the other.
+static_assert(Words(0, ~Bitmap{0}) <= Words(~Bitmap{0}, 0), "A node of all children has to fit the size class array too");
 constexpr uint32_t SlabBytes = 64 * 1024;
 static_assert(SlabBytes > SizeClasses * 8, "A slab has to hold at least one node of its size");
 
