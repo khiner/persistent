@@ -1,6 +1,6 @@
 // Standing benchmark against immer, the reference implementation.
 //   cmake --build build --target HamtBench && ./build/bench/HamtBench
-// Sweep the branching factor by configuring a second build dir with -DHAMT_BITS=5.
+// Sweep the branching factor by configuring a second build dir with -DHAMT_BITS=6.
 
 #include "Hamt.h"
 
@@ -30,16 +30,11 @@ namespace {
 using Clock = std::chrono::steady_clock;
 using ImmerMap = immer::map<uint64_t, uint64_t>;
 
-// Nanoseconds per operation, best of `Rounds`. Timing noise only ever adds, so the minimum is the
-// closest we get to the real cost. `Sink` is there to keep the optimizer from deleting the work.
-//
-// A round repeats the work until it has run for `MinRoundNanos`, then divides by the number of
-// repeats. A thousand lookups take a couple of microseconds, close enough to the clock's own cost that
-// the reading is mostly noise, so the small sizes are only comparable once a round runs for
-// milliseconds.
-// `HAMT_BENCH_ROUNDS` buys wall clock with steadiness, and the whole sweep costs in proportion. Nine
-// reads a single cell more steadily and is worth setting to read one. It does not make the summary
-// below any steadier, which is what a change is judged on, so three is the default.
+// Nanoseconds per operation, best of `Rounds`, since timing noise only ever adds. `Sink` keeps the
+// optimizer from deleting the work. A round repeats until it has run for `MinRoundNanos`, then divides,
+// which is what makes the small sizes comparable: a thousand lookups alone are close enough to the
+// clock's own cost to be mostly noise. `HAMT_BENCH_ROUNDS` buys steadiness with wall clock -- nine to
+// read one cell closely -- but does not steady the summary a change is judged on, so three is default.
 const uint32_t Rounds = [] {
     const auto *rounds = std::getenv("HAMT_BENCH_ROUNDS");
     const auto n = rounds ? std::strtoul(rounds, nullptr, 10) : 0;
@@ -66,9 +61,8 @@ template<typename F> double Time(uint64_t ops, F &&f) {
 }
 
 // Key shape matters as much as key count. immer feeds the key straight to the trie, so a dense key set
-// gives it a dense trie and one with zeroed low bits wastes whole levels. Our fold leaves both shapes
-// alone, so these sweeps compare like with like. A hash that scrambled would trade the wasted levels
-// for a sparse trie on every shape.
+// gives it a dense trie and one with zeroed low bits wastes whole levels. Our fold leaves both alone,
+// so these sweeps compare like with like.
 enum class Pattern { Random,
                      Sequential,
                      Pointer16,
@@ -103,10 +97,9 @@ ImmerMap ImmerBuilt(const std::vector<uint64_t> &keys) {
     return t.persistent();
 }
 
-// The sweep's verdict, accumulated across every row it prints. One cell's margin moves by a tenth on
-// nothing but where the linker put the code, which rerunning the same binary does not resample, so a
-// single cell is not evidence on its own. The mean over all of them holds to a few tenths of a point,
-// because a layout that costs one cell pays another back, and that is what a change is judged on.
+// The sweep's verdict, over every row it prints. One cell's margin moves on nothing but where the
+// linker put the code, which rerunning the same binary does not resample, so a single cell is not
+// evidence. The mean holds steadier, since a layout that costs one cell pays another back.
 double LogRatios = 0;
 uint32_t Cells = 0, Behind = 0;
 
@@ -133,8 +126,7 @@ void Run(uint64_t n, Pattern pattern) {
 
     std::printf("\nn = %llu, %s keys\n", (unsigned long long)n, PatternNames[int(pattern)]);
     // Only our map is live here, so this is what a walk over it covers. A build grows every node up
-    // through the size classes and frees the smaller one each time, so the holes it leaves are the
-    // difference between the two numbers.
+    // through the size classes, freeing the smaller one each time, so the holes it leaves are the gap.
     if (const auto held = hamt::Held())
         std::printf("  %-14s %8.2f MB of node spread over %.2f MB of slab, %.0f%% full (%.0f MB reserved)\n", "footprint", held->LiveBytes / 1048576.0, held->SpannedBytes / 1048576.0, 100.0 * double(held->LiveBytes) / double(held->SpannedBytes), held->ReservedBytes / 1048576.0);
     std::printf("  %-14s %8s %8s %9s\n", "", "ours", "immer", "ours vs");
@@ -157,21 +149,18 @@ void Run(uint64_t n, Pattern pattern) {
     Row("lookup miss",
         Time(n, [&] { uint64_t s = 0; for (auto key : absent) s += hamt::Get(ours, key) != nullptr; return s; }),
         Time(n, [&] { uint64_t s = 0; for (auto key : absent) s += theirs.find(key) != nullptr; return s; }));
-    // Both sides move, which is what lets a write rewrite a path in place instead of copying it: ours
-    // because `Erase` and `Update` take the map by value, immer through the rvalue overloads its
-    // default memory policy turns on. Called on an lvalue instead it copies every path, which is 2.7x
-    // on erase and 2.9x on update at a million keys -- a difference far larger than anything the rows
-    // are meant to be reporting, so the call has to be written this way to measure what it says.
+    // Both sides move, which is what lets a write rewrite a path in place: ours because `Erase` and
+    // `Update` take the map by value, immer through its default policy's rvalue overloads. On an lvalue
+    // both copy every path -- 2.7x on erase and 2.9x on update, swamping what these rows report.
     Row("erase move",
         Time(n, [&] { auto m = ours; for (auto key : keys) m = hamt::Erase(std::move(m), key); return m.Size; }),
         Time(n, [&] { auto m = theirs; for (auto key : keys) m = std::move(m).erase(key); return m.size(); }));
     Row("update move",
         Time(n, [&] { auto m = ours; for (auto key : keys) m = hamt::Update(std::move(m), key, [](uint64_t v) { return v + 1; }); return m.Size; }),
         Time(n, [&] { auto m = theirs; for (auto key : keys) m = std::move(m).update(key, [](uint64_t v) { return v + 1; }); return m.size(); }));
-    // Both libraries walk a map two ways, and the two are worth separating. An iterator has to hold
-    // its position between steps, where a callback keeps it in the call stack, and on immer that is
-    // worth up to 28% at a million keys -- so an iterator row alone would compare our best walk
-    // against their second-best, which is how the erase row above used to read.
+    // Both libraries walk a map two ways, worth separating. An iterator has to hold its position
+    // between steps where a callback keeps it in the call stack, worth up to 28% on immer at a million
+    // keys -- so an iterator row alone would compare our best walk against their second-best.
     Row("iterate",
         Time(n, [&] { uint64_t s = 0; for (const auto &e : ours) s += e.Value; return s; }),
         Time(n, [&] { uint64_t s = 0; for (const auto &e : theirs) s += e.second; return s; }));
@@ -185,11 +174,9 @@ void Run(uint64_t n, Pattern pattern) {
         Time(n, [&] { return uint64_t(ours == ours_twin); }),
         Time(n, [&] { return uint64_t(theirs == theirs_twin); }));
 
-    // Diff has two regimes and they are orders of magnitude apart, so each gets a row. The first is
-    // what reconciliation actually asks for: a map derived from another by a few writes, where both
-    // implementations settle the untouched structure by pointer and pay for the paths down to what
-    // moved and nothing else. Timed per change reported rather than per key, since the point of the
-    // row is that the size of the map does not enter into it.
+    // Diff has two regimes, orders of magnitude apart, so each gets a row. The first is what reconciliation
+    // asks for: a map derived from another by a few writes, where both settle the untouched structure by
+    // pointer. Timed per change reported, since the point is that the size of the map does not enter in.
     const uint64_t edits = n / 100 ? n / 100 : 1, edit_stride = n / edits;
     auto ours_edited = ours;
     auto theirs_edited = theirs;
@@ -197,22 +184,22 @@ void Run(uint64_t n, Pattern pattern) {
         ours_edited = hamt::Set(std::move(ours_edited), keys[i * edit_stride], ~i);
         theirs_edited = theirs_edited.set(keys[i * edit_stride], ~i);
     }
+    const auto our_diff = [](const hamt::Map &x, const hamt::Map &y) { uint64_t s = 0; hamt::Diff(x, y, [&s](const hamt::Change &c) { s += c.Key; }); return s; };
+    const auto immer_diff = [](const ImmerMap &x, const ImmerMap &y) { uint64_t s = 0; const auto add = [&s](const auto &e) { s += e.first; }; immer::diff(x, y, add, add, [&s](const auto &, const auto &e) { s += e.first; }); return s; };
     Row("diff edits",
-        Time(edits, [&] { uint64_t s = 0; hamt::Diff(ours, ours_edited, [&s](const hamt::Change &c) { s += c.Key; }); return s; }),
-        Time(edits, [&] { uint64_t s = 0; immer::diff(theirs, theirs_edited, [&s](const auto &e) { s += e.first; }, [&s](const auto &e) { s += e.first; }, [&s](const auto &, const auto &e) { s += e.first; }); return s; }));
-    // The other regime: the same bindings with no history in common, which neither implementation can
-    // shortcut, so both walk the whole of both tries to report nothing. Per key, and the floor on
-    // what a diff between unrelated maps costs until a node carries a hash of its own contents.
+        Time(edits, [&] { return our_diff(ours, ours_edited); }),
+        Time(edits, [&] { return immer_diff(theirs, theirs_edited); }));
+    // The other regime: the same bindings with no history in common, which neither can shortcut, so both
+    // walk the whole of both tries to report nothing. Per key, and the floor until a node carries a hash.
     Row("diff twins",
-        Time(n, [&] { uint64_t s = 0; hamt::Diff(ours, ours_twin, [&s](const hamt::Change &c) { s += c.Key; }); return s; }),
-        Time(n, [&] { uint64_t s = 0; immer::diff(theirs, theirs_twin, [&s](const auto &e) { s += e.first; }, [&s](const auto &e) { s += e.first; }, [&s](const auto &, const auto &e) { s += e.first; }); return s; }));
+        Time(n, [&] { return our_diff(ours, ours_twin); }),
+        Time(n, [&] { return immer_diff(theirs, theirs_twin); }));
 }
 } // namespace
 
 int main(int argc, char **argv) {
-    // Apple silicon runs a plain process on whichever core is free, and an efficiency core is about
-    // half as fast here. Best-of-`Rounds` only hides that when some round lands on a performance core,
-    // so without this the readings are bimodal.
+    // Apple silicon runs a plain process on whichever core is free, and an efficiency core is about half
+    // as fast here, so without this the readings are bimodal.
     pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
     std::printf("ns/op, lower is better. Last column is our margin over immer.\n");
     // An optional leading key pattern, then sizes.

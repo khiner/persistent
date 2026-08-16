@@ -1,5 +1,5 @@
-// Tests for the from-scratch HAMT. The oracle is immer::map, driven through the same operation
-// sequence and required to agree on every lookup. Both builds are worth running:
+// Tests for the from-scratch HAMT. The oracle is immer::map, driven through the same operations and
+// required to agree on every lookup. Both builds are worth running:
 //   cmake --build build --target HamtTest HamtAuditTest
 //   ./build/tests/HamtTest && ./build/tests/HamtAuditTest
 // HamtAuditTest drops the node free list, which is what lets the reclamation check below see anything.
@@ -170,38 +170,29 @@ int main() {
 
         // Building in one pass has to land on the same trie as inserting one at a time, which is the
         // whole of canonicality and the only thing that makes the two interchangeable. Each shape
-        // below reaches a different corner: keys that share low bits hold the root above them, keys
-        // that differ only at the top drive the trie to full depth, and repeats have to collapse.
+        // below reaches a different corner.
         constexpr uint64_t Step = 0x1000100000000000ull;
         std::mt19937_64 rng{13};
-        for (const int shape : {0, 1, 2, 3, 4}) {
-            std::vector<hamt::Entry> in;
-            switch (shape) {
-                case 0:
-                    for (uint64_t i = 0; i < 2'000; ++i) in.emplace_back(rng(), i);
-                    break;
-                case 1:
-                    for (uint64_t i = 0; i < 2'000; ++i) in.emplace_back(i * 64, i);
-                    break; // Shared low bits.
-                case 2:
-                    for (uint64_t i = 0; i < 8; ++i) in.emplace_back(i * Step, i);
-                    break; // Full depth.
-                case 3:
-                    for (uint64_t i = 0; i < 500; ++i) in.emplace_back(rng() % 64, i);
-                    break; // Heavy repeats.
-                default:
-                    in.emplace_back(7, 7);
-                    in.emplace_back(7, 8);
-                    in.emplace_back(7, 9);
-                    break; // One key only.
-            }
+        const auto keyed = [](uint64_t n, auto key) {
+            std::vector<hamt::Entry> v;
+            for (uint64_t i = 0; i < n; ++i) v.emplace_back(key(i), i);
+            return v;
+        };
+        const std::vector<std::pair<const char *, std::vector<hamt::Entry>>> shapes{
+            {"random", keyed(2'000, [&](uint64_t) { return rng(); })},
+            {"shared low bits", keyed(2'000, [](uint64_t i) { return i * 64; })},
+            {"full depth", keyed(8, [](uint64_t i) { return i * Step; })},
+            {"heavy repeats", keyed(500, [&](uint64_t) { return rng() % 64; })},
+            {"one key only", {{7, 7}, {7, 8}, {7, 9}}},
+        };
+        for (const auto &[shape, in] : shapes) {
             hamt::Map folded{};
             for (const auto &e : in) folded = hamt::Set(std::move(folded), e.Key, e.Value);
             const hamt::Map built{in.begin(), in.end()};
-            expect(hamt::Check(built) >> fatal) << "shape" << shape;
-            expect(built.Size == folded.Size) << "shape" << shape;
-            expect(built.Shift == folded.Shift && built.Prefix == folded.Prefix) << "shape" << shape;
-            expect(built == folded) << "shape" << shape << "should be the same trie either way";
+            expect(hamt::Check(built) >> fatal) << shape;
+            expect(built.Size == folded.Size) << shape;
+            expect(built.Shift == folded.Shift && built.Prefix == folded.Prefix) << shape;
+            expect(built == folded) << shape << "should be the same trie either way";
         }
     };
 
@@ -299,9 +290,9 @@ int main() {
     };
 
     "shared low bits"_test = [] {
-        // Keys whose hashes agree over their low bits leave the root standing above the levels they
-        // agree on, as any set of aligned addresses does. A later key that disagrees down there has to
-        // put those levels back, and erasing it has to take them away again.
+        // Keys whose hashes agree over their low bits leave the root above the levels they agree on, as
+        // aligned addresses do. A later key that disagrees puts those levels back, and erasing it takes
+        // them away again.
         constexpr uint64_t Step = 0x1000100000000000ull; // Hashes varying in bits 12, 28, 44 and 60 only.
         constexpr uint64_t N = 8;
         hamt::Map base{};
@@ -370,8 +361,8 @@ int main() {
     };
 
     "canonical form"_test = [] {
-        // A key range small enough to reach the same contents by many routes, all of which
-        // canonicality says must end at the same trie.
+        // A key range small enough to reach the same contents by many routes, all of which canonicality
+        // says must end at the same trie.
         std::mt19937_64 rng{11};
         std::uniform_int_distribution<uint64_t> key_dist{0, 64};
         hamt::Map ours{};
@@ -417,8 +408,7 @@ int main() {
     };
 
     "iterating pins the structure"_test = [] {
-        // The walk has to keep yielding the bindings the map had when it began, even as that same
-        // map is rebound underneath it.
+        // The walk keeps yielding the bindings the map had when it began, even as that map is rebound.
         constexpr uint64_t N = 200;
         hamt::Map m{};
         for (uint64_t i = 0; i < N; ++i) m = hamt::Set(std::move(m), i * 3, i);
@@ -476,8 +466,7 @@ int main() {
     };
 
     "reclamation"_test = [] {
-        // Every other test here would pass just the same if a reference count leaked or went one too
-        // far. Only the audit build can see it.
+        // Every other test would pass just the same if a reference count leaked or went one too far.
         constexpr uint64_t N = 5'000;
         {
             std::mt19937_64 rng{3};
