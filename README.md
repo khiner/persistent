@@ -5,4 +5,5 @@ Persistent data structures (inspired by immer)
 
 Clang and libc++ only.
 
-See [docs/Literature.md](docs/Literature.md) for the work this builds on and the open design questions.
+See [docs/Literature.md](docs/Literature.md) for the work this builds on. Why this implementation is
+shaped the way it is belongs next to the code that is shaped that way, so it lives in the comments.
