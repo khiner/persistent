@@ -16,7 +16,9 @@
 #pragma clang diagnostic pop
 
 #include <algorithm>
+#include <optional>
 #include <random>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -44,10 +46,51 @@ Bindings Sorted(const immer::map<uint64_t, uint64_t> &m) {
 
 template<typename T> bool Iterates(const hamt::Map &m, const T &expected) { return Sorted(m) == Sorted(expected); }
 
+// The callback walk and the iterator are two routes over the same trie, so they have to agree on the
+// order and not merely on the contents.
+bool WalksInIterationOrder(const hamt::Map &m) {
+    Bindings walked, iterated;
+    hamt::ForEach(m, [&](const hamt::Entry &e) { walked.emplace_back(e.Key, e.Value); });
+    for (const auto &e : m) iterated.emplace_back(e.Key, e.Value);
+    return walked == iterated;
+}
+
 bool Holds(const hamt::Map &m, uint64_t key, uint64_t value) {
     const auto *found = hamt::Get(m, key);
     return found && *found == value;
 }
+
+// A change as plain values, so two lists of them can be sorted and compared.
+using Change = std::tuple<uint64_t, std::optional<uint64_t>, std::optional<uint64_t>>;
+
+std::vector<Change> Diffed(const hamt::Map &a, const hamt::Map &b) {
+    std::vector<Change> v;
+    hamt::Diff(a, b, [&](const hamt::Change &c) {
+        v.emplace_back(c.Key, c.Before ? std::optional{*c.Before} : std::nullopt, c.After ? std::optional{*c.After} : std::nullopt);
+    });
+    std::sort(v.begin(), v.end());
+    return v;
+}
+
+// The same answer reached by looking every key up, which is what the trie walk has to agree with.
+std::vector<Change> DiffedByHand(const hamt::Map &a, const hamt::Map &b) {
+    std::vector<Change> v;
+    for (const auto &e : a) {
+        const auto *after = hamt::Get(b, e.Key);
+        if (!after) v.emplace_back(e.Key, e.Value, std::nullopt);
+        else if (*after != e.Value) v.emplace_back(e.Key, e.Value, *after);
+    }
+    for (const auto &e : b)
+        if (!hamt::Get(a, e.Key)) v.emplace_back(e.Key, std::nullopt, e.Value);
+    std::sort(v.begin(), v.end());
+    return v;
+}
+
+// Both directions, since a diff has to be as right about what was added as about what was removed.
+bool Diffs(const hamt::Map &a, const hamt::Map &b) { return Diffed(a, b) == DiffedByHand(a, b) && Diffed(b, a) == DiffedByHand(b, a); }
+
+// Kept out of `expect`, which would otherwise try to print a tuple.
+bool IsOnly(const std::vector<Change> &changes, const Change &only) { return changes.size() == 1 && changes[0] == only; }
 } // namespace
 
 using namespace boost::ut;
@@ -98,9 +141,113 @@ int main() {
         expect(Holds(erased, 1, 100));
     };
 
+    "built from entries"_test = [] {
+        expect(hamt::Map{}.Size == 0_u64);
+        const hamt::Map listed{{1, 100}, {2, 200}, {3, 300}};
+        expect(listed.Size == 3_u64);
+        expect(Holds(listed, 2, 200));
+        expect(hamt::Check(listed) >> fatal);
+        // A repeated key lands where the last of them puts it, as a repeated `Set` would.
+        const hamt::Map repeated{{1, 100}, {1, 101}};
+        expect(repeated.Size == 1_u64);
+        expect(Holds(repeated, 1, 101));
+
+        // From a range, over anything with a `Key` and a `Value` -- including another map, which is
+        // the shortest way to a twin that shares no structure with what it copied.
+        std::vector<hamt::Entry> entries;
+        Bindings expected;
+        for (uint64_t i = 0; i < 1'000; ++i) {
+            entries.emplace_back(i * 37, i);
+            expected.emplace_back(i * 37, i);
+        }
+        const hamt::Map ranged{entries.begin(), entries.end()};
+        expect(hamt::Check(ranged) >> fatal);
+        expect(Iterates(ranged, expected));
+        const hamt::Map twin{hamt::begin(ranged), hamt::end(ranged)};
+        expect(twin == ranged);
+        expect(twin.Root != ranged.Root) << "built again from scratch, so it shares no node";
+        expect(hamt::Map{entries.begin(), entries.begin()}.Size == 0_u64) << "an empty range";
+
+        // Building in one pass has to land on the same trie as inserting one at a time, which is the
+        // whole of canonicality and the only thing that makes the two interchangeable. Each shape
+        // below reaches a different corner: keys that share low bits hold the root above them, keys
+        // that differ only at the top drive the trie to full depth, and repeats have to collapse.
+        constexpr uint64_t Step = 0x1000100000000000ull;
+        std::mt19937_64 rng{13};
+        for (const int shape : {0, 1, 2, 3, 4}) {
+            std::vector<hamt::Entry> in;
+            switch (shape) {
+                case 0:
+                    for (uint64_t i = 0; i < 2'000; ++i) in.emplace_back(rng(), i);
+                    break;
+                case 1:
+                    for (uint64_t i = 0; i < 2'000; ++i) in.emplace_back(i * 64, i);
+                    break; // Shared low bits.
+                case 2:
+                    for (uint64_t i = 0; i < 8; ++i) in.emplace_back(i * Step, i);
+                    break; // Full depth.
+                case 3:
+                    for (uint64_t i = 0; i < 500; ++i) in.emplace_back(rng() % 64, i);
+                    break; // Heavy repeats.
+                default:
+                    in.emplace_back(7, 7);
+                    in.emplace_back(7, 8);
+                    in.emplace_back(7, 9);
+                    break; // One key only.
+            }
+            hamt::Map folded{};
+            for (const auto &e : in) folded = hamt::Set(std::move(folded), e.Key, e.Value);
+            const hamt::Map built{in.begin(), in.end()};
+            expect(hamt::Check(built) >> fatal) << "shape" << shape;
+            expect(built.Size == folded.Size) << "shape" << shape;
+            expect(built.Shift == folded.Shift && built.Prefix == folded.Prefix) << "shape" << shape;
+            expect(built == folded) << "shape" << shape << "should be the same trie either way";
+        }
+    };
+
+    "update"_test = [] {
+        const auto inc = [](uint64_t v) { return v + 1; };
+        // A key the map does not hold is updated from zero, which is what immer's default-constructed
+        // value comes to. `UpdateIfExists` leaves the same key alone.
+        const auto fresh = hamt::Update({}, 7, inc);
+        expect(fresh.Size == 1_u64);
+        expect(Holds(fresh, 7, 1));
+        expect(Holds(hamt::Update(fresh, 7, inc), 7, 2));
+        expect(hamt::UpdateIfExists(hamt::Map{}, 7, inc).Size == 0_u64);
+        const auto missed = hamt::UpdateIfExists(fresh, 8, inc);
+        expect(missed.Size == 1_u64);
+        expect(hamt::Get(missed, 8) == nullptr);
+        expect(missed.Root == fresh.Root) << "a miss should leave the trie where it was";
+        expect(Holds(hamt::UpdateIfExists(fresh, 7, inc), 7, 2));
+
+        // The callable sees what the key holds now, and is called once or not at all.
+        uint64_t calls = 0;
+        hamt::Update(fresh, 7, [&](uint64_t v) { ++calls; expect(v == 1_u64); return v; });
+        hamt::UpdateIfExists(fresh, 8, [&](uint64_t v) { ++calls; return v; });
+        expect(calls == 1_u64);
+
+        // On a map deep enough that a write copies a path, which the input has to survive.
+        hamt::Map m{};
+        for (uint64_t i = 0; i < 1'000; ++i) m = hamt::Set(std::move(m), i * 37, i);
+        for (const auto &bumped : {hamt::Update(m, 500 * 37, inc), hamt::UpdateIfExists(m, 500 * 37, inc)}) {
+            expect(hamt::Check(bumped) >> fatal);
+            expect(bumped.Size == m.Size);
+            expect(Holds(bumped, 500 * 37, 501));
+            expect(Holds(m, 500 * 37, 500)) << "the update left its input alone";
+        }
+        // A key it does not hold grows it, so the trie has to come out canonical either way.
+        const auto grown = hamt::Update(m, 1, inc);
+        expect(hamt::Check(grown) >> fatal);
+        expect(grown.Size == m.Size + 1);
+        expect(Holds(grown, 1, 1));
+    };
+
     "iterate"_test = [] {
         const hamt::Map empty{};
         expect(hamt::begin(empty) == hamt::end(empty));
+        uint64_t visits = 0;
+        hamt::ForEach(empty, [&](const hamt::Entry &) { ++visits; });
+        expect(visits == 0_u64) << "walking an empty map should call nothing";
 
         hamt::Map m{};
         Bindings expected;
@@ -109,6 +256,9 @@ int main() {
             expected.emplace_back(i * i, i);
         }
         expect(Iterates(m, expected));
+        expect(WalksInIterationOrder(m));
+        hamt::ForEach(m, [&](const hamt::Entry &) { ++visits; });
+        expect(visits == m.Size) << "every binding once and no more";
     };
 
     "equality"_test = [] {
@@ -188,12 +338,26 @@ int main() {
         immer::map<uint64_t, uint64_t> theirs;
         for (uint64_t i = 0; i < 100'000; ++i) {
             const auto key = key_dist(rng);
-            if (rng() % 4 == 0) {
-                ours = hamt::Erase(ours, key);
-                theirs = theirs.erase(key);
-            } else {
-                ours = hamt::Set(ours, key, i);
-                theirs = theirs.set(key, i);
+            // Both maps update a missing key from a zero of their own: ours by definition, immer's by
+            // default construction. Driving them together is what holds the two definitions to each other.
+            const auto bump = [i](uint64_t v) { return v + i; };
+            switch (rng() % 4) {
+                case 0:
+                    ours = hamt::Erase(ours, key);
+                    theirs = theirs.erase(key);
+                    break;
+                case 1:
+                    ours = hamt::Update(ours, key, bump);
+                    theirs = theirs.update(key, bump);
+                    break;
+                case 2:
+                    ours = hamt::UpdateIfExists(ours, key, bump);
+                    theirs = theirs.update_if_exists(key, bump);
+                    break;
+                default:
+                    ours = hamt::Set(ours, key, i);
+                    theirs = theirs.set(key, i);
+                    break;
             }
             const auto *expected = theirs.find(key);
             const auto *actual = hamt::Get(ours, key);
@@ -267,6 +431,48 @@ int main() {
         }
         expect(seen == N);
         for (uint64_t i = 0; i < N; ++i) expect(Holds(m, i * 3, i + 1'000));
+    };
+
+    "diff"_test = [] {
+        const hamt::Map empty{};
+        expect(Diffed(empty, empty).empty());
+
+        hamt::Map m{};
+        for (uint64_t i = 0; i < 500; ++i) m = hamt::Set(std::move(m), i * 37, i);
+        expect(Diffed(m, m).empty()) << "a map against itself";
+        expect(Diffs(empty, m)) << "everything against nothing";
+
+        // One binding at a time, so each of the three kinds of change is pinned down on its own.
+        expect(IsOnly(Diffed(m, hamt::Set(m, 1, 1)), {1, std::nullopt, 1})) << "a key added";
+        expect(IsOnly(Diffed(m, hamt::Set(m, 0, 9)), {0, 0, 9})) << "a value rebound";
+        expect(IsOnly(Diffed(m, hamt::Erase(m, 37)), {37, 1, std::nullopt})) << "a key removed";
+
+        // Maps that share history, and maps built separately from overlapping keys, which share none.
+        std::mt19937_64 rng{5};
+        std::uniform_int_distribution<uint64_t> key_dist{0, 2'000};
+        for (uint64_t round = 0; round < 50; ++round) {
+            auto b = m;
+            for (uint64_t i = 0; i < round; ++i) {
+                const auto key = key_dist(rng) * 37;
+                b = rng() % 3 ? hamt::Set(std::move(b), key, rng()) : hamt::Erase(std::move(b), key);
+            }
+            expect(Diffs(m, b) >> fatal) << "after" << round << "edits";
+        }
+
+        hamt::Map twin{};
+        for (uint64_t i = 250; i < 750; ++i) twin = hamt::Set(std::move(twin), i * 37, i + 1);
+        expect(Diffs(m, twin)) << "no shared structure, half the keys in common";
+
+        // Roots at different levels, which only aligning them can get right: `deep`'s keys agree over
+        // twelve low bits and hold its root above them, and the other two do not.
+        constexpr uint64_t Step = 0x1000100000000000ull;
+        hamt::Map deep{};
+        for (uint64_t i = 1; i <= 8; ++i) deep = hamt::Set(std::move(deep), i * Step, i);
+        expect((deep.Shift > 0u) >> fatal);
+        expect(Diffs(deep, hamt::Set(deep, 1, 1))) << "a key diverging below the root";
+        expect(Diffs(deep, hamt::Set(deep, 32, 32))) << "a key diverging one level under the root";
+        expect(Diffs(deep, m)) << "no key in common, and roots at different levels";
+        expect(Diffs(deep, hamt::Erase(deep, Step))) << "still deep, one key fewer";
     };
 
     "reclamation"_test = [] {

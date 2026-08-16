@@ -20,10 +20,20 @@ static_assert(Bits == 5 || Bits == 6, "A slot map has to be exactly one machine 
 using Bitmap = std::conditional_t<Bits == 6, uint64_t, uint32_t>;
 constexpr Bitmap Mask = (Bitmap{1} << Bits) - 1;
 
-// The fold is a bijection, so distinct keys never share a hash and the trie always separates them
-// before it bottoms out, which is why there are no collision nodes. It folds the top half of the key
-// down and stops there. A second fold would reach into bits that a strided key set does not vary,
-// spreading keys that were adjacent. Rationale in docs/Literature.md.
+// Fold the key, do not scramble it. A dense key set is the best case a trie has -- every node full,
+// every key at the same depth -- and counters, object ids and row numbers hand that over for free,
+// which any good mixer would destroy. A fold keeps it, since each xor-shift is a bijection on
+// `[0, 2^k)`, while still filling low bits that never vary from bits that do.
+//
+// The fold being a bijection also means distinct keys never share a hash, so the trie always
+// separates them before it bottoms out and there are no collision nodes.
+//
+// One fold and no more, and the reason is subtler than the invariant above. A counter is dense on an
+// interval, but a heap address is dense on a *stride*, and a stride is not an interval: folding bits
+// 16 and up into the low four leaves such a set a permutation of itself yet no longer a lattice, and
+// a trie that was going to be full is scattered instead -- four times the nodes for the same entries,
+// on the very key shape the second fold was meant to protect. Keys whose low bits never vary, which
+// is what it did protect against, cost one level at the root and are handled by `Map::Shift` instead.
 constexpr uint64_t Hash(uint64_t x) { return x ^ (x >> 32); }
 
 constexpr uint32_t Idx(uint64_t hash, uint32_t shift) { return static_cast<uint32_t>((hash >> shift) & Mask); }
@@ -269,21 +279,42 @@ struct SetResult {
 
 // `owned` means every node from the root down to `n` is named exactly once, so no other map can see
 // a write and rewriting in place is unobservable. Returning `n` leaves the path above it untouched.
-SetResult DoSet(const Node *n, Entry e, uint64_t hash, uint32_t shift, bool owned) {
+// `value` says what to store, given the value the key is bound to now or null when it is bound to
+// nothing, and is where `Set` and `Update` part company: one ignores its argument and the other is a
+// function of it. It folds away into each instantiation, so `Set` compiles to the instructions it
+// did before `Update` existed.
+template<typename F> SetResult DoSet(const Node *n, uint64_t key, F value, uint64_t hash, uint32_t shift, bool owned) {
     const Bitmap bit = Bitmap{1} << Idx(hash, shift);
     if (n->Datamap & bit) {
         const auto off = DataOffset(*n, bit);
         const auto old = Entries(n)[off];
-        if (old.Key == e.Key) return {WithEntry(n, off, e, owned), false};
-        return {WithEntryPromoted(n, bit, Merged(old, Hash(old.Key), e, hash, shift + Bits)), true};
+        if (old.Key == key) return {WithEntry(n, off, {key, value(&old.Value)}, owned), false};
+        return {WithEntryPromoted(n, bit, Merged(old, Hash(old.Key), {key, value(nullptr)}, hash, shift + Bits)), true};
     }
     if (n->Nodemap & bit) {
         const auto off = ChildOffset(*n, bit);
         const auto *child = Children(n)[off];
-        const auto r = DoSet(child, e, hash, shift + Bits, owned && child->Refs == 1);
+        const auto r = DoSet(child, key, value, hash, shift + Bits, owned && child->Refs == 1);
         return {WithChild(n, off, child, r.Root, owned), r.Added};
     }
-    return {WithEntryInserted(n, bit, e), true};
+    return {WithEntryInserted(n, bit, {key, value(nullptr)}), true};
+}
+
+// A rebind that gives up when there is no such key, which null reports. The copies a path costs are
+// made as the recursion unwinds, so a miss has allocated nothing by the time it gets back to the top.
+template<typename F> const Node *DoRebind(const Node *n, uint64_t key, F value, uint64_t hash, uint32_t shift, bool owned) {
+    const Bitmap bit = Bitmap{1} << Idx(hash, shift);
+    if (n->Datamap & bit) {
+        const auto off = DataOffset(*n, bit);
+        const auto old = Entries(n)[off];
+        if (old.Key != key) return nullptr;
+        return WithEntry(n, off, {key, value(old.Value)}, owned);
+    }
+    if (!(n->Nodemap & bit)) return nullptr;
+    const auto off = ChildOffset(*n, bit);
+    const auto *child = Children(n)[off];
+    const auto *updated = DoRebind(child, key, value, hash, shift + Bits, owned && child->Refs == 1);
+    return updated ? WithChild(n, off, child, updated, owned) : nullptr;
 }
 
 enum class EraseStatus {
@@ -337,6 +368,113 @@ bool SameNodes(const Node *a, const Node *b) {
     for (uint32_t i = 0, nc = ChildCount(*a); i < nc; ++i)
         if (!SameNodes(ca[i], cb[i])) return false;
     return true;
+}
+
+// Where a diff reports to. Carried by reference through the walk, so nothing is allocated and the
+// caller's callable is reached through one indirect call rather than a `std::function`.
+struct Sink {
+    void (*Report)(void *, const Change &);
+    void *Context;
+
+    void operator()(uint64_t key, const uint64_t *before, const uint64_t *after) const { Report(Context, {key, before, after}); }
+};
+
+template<typename F> void ForEach(const Node *n, const F &f) {
+    const auto *es = Entries(n);
+    for (uint32_t i = 0, dc = DataCount(*n); i < dc; ++i) f(es[i]);
+    const auto *const *cs = Children(n);
+    for (uint32_t i = 0, nc = ChildCount(*n); i < nc; ++i) ForEach(cs[i], f);
+}
+
+// Everything under `n`, where the other map has nothing at all: every binding is a change.
+void ReportAll(const Node *n, bool added, const Sink &sink) {
+    ForEach(n, [&](const Entry &e) { sink(e.Key, added ? nullptr : &e.Value, added ? &e.Value : nullptr); });
+}
+
+// The same, minus the one slot the walk is about to follow further down.
+void ReportAllBut(const Node *n, Bitmap keep, bool added, const Sink &sink) {
+    const auto *es = Entries(n);
+    uint32_t i = 0;
+    for (auto m = n->Datamap; m; m &= m - 1, ++i)
+        if ((Bitmap{1} << std::countr_zero(m)) != keep) sink(es[i].Key, added ? nullptr : &es[i].Value, added ? &es[i].Value : nullptr);
+    const auto *const *cs = Children(n);
+    uint32_t j = 0;
+    for (auto m = n->Nodemap; m; m &= m - 1, ++j)
+        if ((Bitmap{1} << std::countr_zero(m)) != keep) ReportAll(cs[j], added, sink);
+}
+
+// One map holds a single entry where the other holds a whole subtrie. Everything in the subtrie is a
+// change except the one binding that might carry the same key. `lone_from_a` says which way round.
+void DiffLoneAgainst(const Entry &lone, const Node *n, bool lone_from_a, const Sink &sink) {
+    bool matched = false;
+    ForEach(n, [&](const Entry &e) {
+        if (e.Key != lone.Key) {
+            sink(e.Key, lone_from_a ? nullptr : &e.Value, lone_from_a ? &e.Value : nullptr);
+        } else {
+            matched = true;
+            if (e.Value != lone.Value) sink(e.Key, lone_from_a ? &lone.Value : &e.Value, lone_from_a ? &e.Value : &lone.Value);
+        }
+    });
+    if (!matched) sink(lone.Key, lone_from_a ? &lone.Value : nullptr, lone_from_a ? nullptr : &lone.Value);
+}
+
+// Two nodes standing at the same level. Structure the maps share settles a whole subtrie at once, and
+// a slot the two disagree about is one of nine cases: each side holds an entry, a child, or nothing.
+void DiffNodes(const Node *a, const Node *b, const Sink &sink) {
+    if (a == b) return;
+    for (auto rest = Bitmap(a->Datamap | a->Nodemap | b->Datamap | b->Nodemap); rest; rest &= rest - 1) {
+        const Bitmap bit = Bitmap{1} << std::countr_zero(rest);
+        if (a->Datamap & bit) {
+            const auto &ea = Entries(a)[DataOffset(*a, bit)];
+            if (b->Datamap & bit) {
+                const auto &eb = Entries(b)[DataOffset(*b, bit)];
+                // A slot is placed by hash, so two entries sharing one need not share a key.
+                if (ea.Key != eb.Key) {
+                    sink(ea.Key, &ea.Value, nullptr);
+                    sink(eb.Key, nullptr, &eb.Value);
+                } else if (ea.Value != eb.Value) {
+                    sink(ea.Key, &ea.Value, &eb.Value);
+                }
+            } else if (b->Nodemap & bit) {
+                DiffLoneAgainst(ea, Children(b)[ChildOffset(*b, bit)], true, sink);
+            } else {
+                sink(ea.Key, &ea.Value, nullptr);
+            }
+        } else if (a->Nodemap & bit) {
+            const auto *ca = Children(a)[ChildOffset(*a, bit)];
+            if (b->Nodemap & bit) DiffNodes(ca, Children(b)[ChildOffset(*b, bit)], sink);
+            else if (b->Datamap & bit) DiffLoneAgainst(Entries(b)[DataOffset(*b, bit)], ca, false, sink);
+            else ReportAll(ca, false, sink);
+        } else if (b->Datamap & bit) {
+            const auto &eb = Entries(b)[DataOffset(*b, bit)];
+            sink(eb.Key, nullptr, &eb.Value);
+        } else {
+            ReportAll(Children(b)[ChildOffset(*b, bit)], true, sink);
+        }
+    }
+}
+
+// Where the shallower root ends up once it has come down to the deeper one's level: on a node there,
+// or on a lone entry, or on nothing at all.
+struct Aligned {
+    const Node *At{};
+    const Entry *Lone{};
+};
+
+// Brings a root down from `from` to `to` along `prefix`. Every key in the other map agrees on those
+// bits, so nothing beside that path can be in it and all of it is reported on the way past.
+Aligned Align(const Node *n, uint32_t from, uint32_t to, uint64_t prefix, bool added, const Sink &sink) {
+    for (auto shift = from; shift < to; shift += Bits) {
+        const Bitmap bit = Bitmap{1} << Idx(prefix, shift);
+        ReportAllBut(n, bit, added, sink);
+        if (n->Nodemap & bit) {
+            n = Children(n)[ChildOffset(*n, bit)];
+            continue;
+        }
+        if (n->Datamap & bit) return {nullptr, &Entries(n)[DataOffset(*n, bit)]};
+        return {};
+    }
+    return {n, nullptr};
 }
 
 // `prefix` is the low `shift` hash bits the path down to `n` has already fixed. Confirms every entry
@@ -427,15 +565,15 @@ Map Grown(Map m, Entry e, uint64_t hash, uint32_t shift) {
     Children(root)[0] = chain;
     return {root, m.Size + 1, m.Prefix & ((uint64_t{1} << shift) - 1), shift};
 }
-} // namespace
 
-Map Set(Map m, uint64_t key, uint64_t value) {
-    const Entry e{key, value};
+// The whole of a write that can add a key. `Set` reaches it with a constant and `Update` with a
+// function of the binding it displaces, and nothing from here down knows the difference.
+template<typename F> Map SetWith(Map m, uint64_t key, F value) {
     const auto hash = Hash(key);
-    if (!m.Root) return Lone(e);
+    if (!m.Root) return Lone({key, value(nullptr)});
     // A key that disagrees over the bits the root skips belongs above the root, not under it.
-    if (const auto diff = (hash ^ m.Prefix) & ((uint64_t{1} << m.Shift) - 1)) return Grown(std::move(m), e, hash, uint32_t(std::countr_zero(diff)) / Bits * Bits);
-    const auto r = DoSet(m.Root, e, hash, m.Shift, m.Root->Refs == 1);
+    if (const auto diff = (hash ^ m.Prefix) & ((uint64_t{1} << m.Shift) - 1)) return Grown(std::move(m), {key, value(nullptr)}, hash, uint32_t(std::countr_zero(diff)) / Bits * Bits);
+    const auto r = DoSet(m.Root, key, value, hash, m.Shift, m.Root->Refs == 1);
     // A root rewritten in place is still the one `m` holds, so hand that reference on.
     Map out = r.Root == m.Root ? std::move(m) : Map{r.Root, m.Size, m.Prefix, m.Shift};
     out.Size += r.Added;
@@ -443,6 +581,96 @@ Map Set(Map m, uint64_t key, uint64_t value) {
     // subtrie under it is a chain until the two keys diverge. Nothing else here can build one.
     if (out.Size == 2) Compress(out);
     return out;
+}
+
+// What one slot of a bulk build came to: a subtrie, or the single binding it collapsed to. A slot
+// holding one binding is inlined by the parent and never gets a node, which is what keeps the result
+// canonical when the same key turns up more than once.
+struct Piece {
+    const Node *Child; // Null when the slot is a lone entry.
+    Entry Lone;
+};
+
+// The subtrie for `n` entries that agree on the low `shift` hash bits. They are partitioned by slot
+// into `to`, and `from` becomes the scratch the level below partitions into, so the two buffers
+// alternate all the way down and nothing else is allocated but the nodes themselves.
+Piece Assemble(Entry *from, Entry *to, uint64_t n, uint32_t shift, uint64_t &placed) {
+    if (n == 1) {
+        ++placed;
+        return {nullptr, from[0]};
+    }
+    // Agreeing on all 64 bits is agreeing on the key, since the fold is a bijection. So these are
+    // repeats of one key, and the last of them wins as it would through a repeated `Set`.
+    if (shift >= 64) {
+        ++placed;
+        return {nullptr, from[n - 1]};
+    }
+    constexpr uint32_t Slots = Mask + 1;
+    uint64_t counts[Slots]{}, start[Slots], cursor[Slots];
+    for (uint64_t i = 0; i < n; ++i) ++counts[Idx(Hash(from[i].Key), shift)];
+    for (uint32_t s = 0, running = 0; s < Slots; ++s) {
+        start[s] = cursor[s] = running;
+        running += counts[s];
+    }
+    // Stable, so that the last repeat of a key is still the last one when its slot is read back.
+    for (uint64_t i = 0; i < n; ++i) to[cursor[Idx(Hash(from[i].Key), shift)]++] = from[i];
+
+    Bitmap datamap = 0, nodemap = 0;
+    Entry entries[Slots];
+    const Node *children[Slots];
+    uint32_t ne = 0, nc = 0;
+    for (uint32_t s = 0; s < Slots; ++s) {
+        if (!counts[s]) continue;
+        const auto piece = Assemble(to + start[s], from + start[s], counts[s], shift + Bits, placed);
+        if (piece.Child) {
+            nodemap |= Bitmap{1} << s;
+            children[nc++] = piece.Child;
+        } else {
+            datamap |= Bitmap{1} << s;
+            entries[ne++] = piece.Lone;
+        }
+    }
+    // Everything here was one key repeated, so there is no node to build after all.
+    if (nc == 0 && ne == 1) return {nullptr, entries[0]};
+    auto *node = Alloc(datamap, nodemap);
+    std::memcpy(Entries(node), entries, ne * sizeof(Entry));
+    std::memcpy(static_cast<void *>(Children(node)), static_cast<const void *>(children), nc * sizeof(const Node *));
+    return {node, {}};
+}
+} // namespace
+
+Map Build(const Entry *first, const Entry *last) {
+    const auto n = uint64_t(last - first);
+    if (!n) return {};
+    // One allocation for both halves of the ping-pong, and the entries copied into the first, since
+    // the partition reorders what it is given and the caller's array is not ours to disturb.
+    auto *scratch = static_cast<Entry *>(std::malloc(2 * n * sizeof(Entry)));
+    std::memcpy(scratch, first, n * sizeof(Entry));
+    uint64_t placed = 0;
+    const auto piece = Assemble(scratch, scratch + n, n, 0, placed);
+    std::free(scratch);
+    if (!piece.Child) return Lone(piece.Lone); // Every entry carried the same key.
+    Map m{piece.Child, placed, 0, 0};
+    Compress(m); // Keys that agree on their low bits leave a chain above where they diverge.
+    return m;
+}
+
+Map Set(Map m, uint64_t key, uint64_t value) {
+    return SetWith(std::move(m), key, [value](const uint64_t *) { return value; });
+}
+
+Map Update(Map m, uint64_t key, uint64_t (*fn)(void *, uint64_t), void *context) {
+    return SetWith(std::move(m), key, [fn, context](const uint64_t *current) { return fn(context, current ? *current : 0); });
+}
+
+Map UpdateIfExists(Map m, uint64_t key, uint64_t (*fn)(void *, uint64_t), void *context) {
+    if (!m.Root) return m;
+    // Nothing tests the bits the root skips, for the reason `Get` gives: a key that disagrees on them
+    // lands on some other key and fails the comparison it was going to make anyway.
+    const auto *root = DoRebind(m.Root, key, [fn, context](uint64_t current) { return fn(context, current); }, Hash(key), m.Shift, m.Root->Refs == 1);
+    if (!root) return m; // No such key, and no node copied on the way to finding that out.
+    // A rebind leaves the shape alone, so the size stands and there is nothing to compress.
+    return root == m.Root ? std::move(m) : Map{root, m.Size, m.Prefix, m.Shift};
 }
 
 Map Erase(Map m, uint64_t key) {
@@ -481,11 +709,51 @@ const uint64_t *Get(const Map &m, uint64_t key) {
     }
 }
 
+void ForEachChunk(const Map &m, void (*visit)(void *, const Entry *, const Entry *), void *context) {
+    if (!m.Root) return; // An empty map has no root, and so calls nothing.
+    // A node's entries, then each child's, which is the order the iterator takes as well. The stack
+    // is explicit rather than the call stack's, so that nothing here recurses and the whole walk can
+    // be inlined into the caller -- which is what turns `visit` from a call through a pointer into
+    // the caller's own loop body. Worth 20% at a thousand keys, where nothing waits on memory and
+    // the call was a real share of the work.
+    Iterator::Frame stack[Iterator::MaxDepth];
+    uint32_t depth = 0;
+    for (const auto *n = m.Root;;) {
+        if (const auto dc = DataCount(*n)) visit(context, Entries(n), Entries(n) + dc);
+        if (const auto nc = ChildCount(*n)) stack[depth++] = {Children(n), Children(n) + nc};
+        while (depth && stack[depth - 1].Child == stack[depth - 1].ChildEnd) --depth;
+        if (!depth) return;
+        n = *stack[depth - 1].Child++;
+    }
+}
+
 bool operator==(const Map &a, const Map &b) {
     if (a.Root == b.Root) return true; // Two empty maps, or two that share a root outright.
     if (!a.Root || !b.Root) return false; // Only an empty map has a null root, so one of them is empty.
     // The size test is an early out and nothing more: `SameNodes` would reject a mismatch anyway.
     return a.Size == b.Size && SameNodes(a.Root, b.Root);
+}
+
+void Diff(const Map &a, const Map &b, void (*report)(void *, const Change &), void *context) {
+    const Sink sink{report, context};
+    if (a.Root == b.Root) return; // Two empty maps, or two that share a root outright.
+    if (!a.Root) return ReportAll(b.Root, true, sink);
+    if (!b.Root) return ReportAll(a.Root, false, sink);
+    // Each root stands above the bits its own keys agree on, so the two can sit at different levels.
+    const auto shared = a.Shift < b.Shift ? a.Shift : b.Shift;
+    if ((a.Prefix ^ b.Prefix) & ((uint64_t{1} << shared) - 1)) {
+        // They disagree inside bits that both maps hold fixed, so they have no key in common.
+        ReportAll(a.Root, false, sink);
+        return ReportAll(b.Root, true, sink);
+    }
+    if (a.Shift == b.Shift) return DiffNodes(a.Root, b.Root, sink);
+    // The shallower root has to come down to the deeper one before the two can be walked in step.
+    const bool deeper = b.Shift > a.Shift;
+    const auto *deep = deeper ? b.Root : a.Root;
+    const auto aligned = Align(deeper ? a.Root : b.Root, shared, deeper ? b.Shift : a.Shift, deeper ? b.Prefix : a.Prefix, !deeper, sink);
+    if (aligned.At) return deeper ? DiffNodes(aligned.At, deep, sink) : DiffNodes(deep, aligned.At, sink);
+    if (aligned.Lone) return DiffLoneAgainst(*aligned.Lone, deep, deeper, sink);
+    ReportAll(deep, deeper, sink);
 }
 
 bool Check(const Map &m) {
