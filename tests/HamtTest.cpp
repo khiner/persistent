@@ -104,9 +104,9 @@ int main() {
     };
 
     "set and get"_test = [] {
-        auto m = hamt::Set({}, 1, 100);
-        m = hamt::Set(m, 2, 200);
-        m = hamt::Set(m, 3, 300);
+        auto m = hamt::InsertOrAssign({}, 1, 100);
+        m = hamt::InsertOrAssign(m, 2, 200);
+        m = hamt::InsertOrAssign(m, 3, 300);
         expect(m.Size == 3_u64);
         expect(Holds(m, 1, 100));
         expect(Holds(m, 2, 200));
@@ -115,14 +115,14 @@ int main() {
     };
 
     "overwrite"_test = [] {
-        const auto m = hamt::Set(hamt::Set({}, 1, 100), 1, 101);
+        const auto m = hamt::InsertOrAssign(hamt::InsertOrAssign({}, 1, 100), 1, 101);
         expect(m.Size == 1_u64);
         expect(Holds(m, 1, 101));
     };
 
     "persistence"_test = [] {
-        const auto before = hamt::Set({}, 1, 100);
-        const auto after = hamt::Set(before, 2, 200);
+        const auto before = hamt::InsertOrAssign({}, 1, 100);
+        const auto after = hamt::InsertOrAssign(before, 2, 200);
         expect(before.Size == 1_u64);
         expect(hamt::Get(before, 2) == nullptr);
         expect(after.Size == 2_u64);
@@ -135,7 +135,7 @@ int main() {
     };
 
     "erase misses"_test = [] {
-        const auto m = hamt::Set({}, 1, 100);
+        const auto m = hamt::InsertOrAssign({}, 1, 100);
         const auto erased = hamt::Erase(m, 2);
         expect(erased.Size == 1_u64);
         expect(Holds(erased, 1, 100));
@@ -147,7 +147,7 @@ int main() {
         expect(listed.Size == 3_u64);
         expect(Holds(listed, 2, 200));
         expect(hamt::Check(listed) >> fatal);
-        // A repeated key lands where the last of them puts it, as a repeated `Set` would.
+        // A repeated key lands where the last of them puts it, as a repeated `InsertOrAssign` would.
         const hamt::Map repeated{{1, 100}, {1, 101}};
         expect(repeated.Size == 1_u64);
         expect(Holds(repeated, 1, 101));
@@ -188,7 +188,7 @@ int main() {
         };
         for (const auto &[shape, in] : shapes) {
             hamt::Map folded{};
-            for (const auto &e : in) folded = hamt::Set(std::move(folded), e.Key, e.Value);
+            for (const auto &e : in) folded = hamt::InsertOrAssign(std::move(folded), e.Key, e.Value);
             const hamt::Map built{in.begin(), in.end()};
             expect(hamt::Check(built) >> fatal) << shape;
             expect(built.Size == folded.Size) << shape;
@@ -220,7 +220,7 @@ int main() {
 
         // On a map deep enough that a write copies a path, which the input has to survive.
         hamt::Map m{};
-        for (uint64_t i = 0; i < 1'000; ++i) m = hamt::Set(std::move(m), i * 37, i);
+        for (uint64_t i = 0; i < 1'000; ++i) m = hamt::InsertOrAssign(std::move(m), i * 37, i);
         for (const auto &bumped : {hamt::Update(m, 500 * 37, inc), hamt::UpdateIfExists(m, 500 * 37, inc)}) {
             expect(hamt::Check(bumped) >> fatal);
             expect(bumped.Size == m.Size);
@@ -244,7 +244,7 @@ int main() {
         hamt::Map m{};
         Bindings expected;
         for (uint64_t i = 0; i < 1'000; ++i) {
-            m = hamt::Set(std::move(m), i * i, i);
+            m = hamt::InsertOrAssign(std::move(m), i * i, i);
             expected.emplace_back(i * i, i);
         }
         expect(Iterates(m, expected));
@@ -256,14 +256,14 @@ int main() {
     "equality"_test = [] {
         // Built in opposite orders, so equality has no shared history to fall back on.
         hamt::Map forward{}, backward{};
-        for (uint64_t i = 0; i < 1'000; ++i) forward = hamt::Set(std::move(forward), i * 7, i);
-        for (uint64_t i = 1'000; i-- > 0;) backward = hamt::Set(std::move(backward), i * 7, i);
+        for (uint64_t i = 0; i < 1'000; ++i) forward = hamt::InsertOrAssign(std::move(forward), i * 7, i);
+        for (uint64_t i = 1'000; i-- > 0;) backward = hamt::InsertOrAssign(std::move(backward), i * 7, i);
         expect(forward == backward);
         expect(hamt::Map{} == hamt::Map{});
         expect(!(forward == hamt::Map{}));
-        expect(!(forward == hamt::Set(forward, 1, 1))); // An extra binding.
-        expect(!(forward == hamt::Set(forward, 0, 1))); // Same keys, one value changed.
-        expect(hamt::Erase(hamt::Set(forward, 1, 1), 1) == forward); // Round trip back to canonical.
+        expect(!(forward == hamt::InsertOrAssign(forward, 1, 1))); // An extra binding.
+        expect(!(forward == hamt::InsertOrAssign(forward, 0, 1))); // Same keys, one value changed.
+        expect(hamt::Erase(hamt::InsertOrAssign(forward, 1, 1), 1) == forward); // Round trip back to canonical.
     };
 
     "full depth"_test = [] {
@@ -274,7 +274,7 @@ int main() {
         hamt::Map m{};
         Bindings expected;
         for (uint64_t i = 0; i < N; ++i) {
-            m = hamt::Set(std::move(m), i * Step, i);
+            m = hamt::InsertOrAssign(std::move(m), i * Step, i);
             expected.emplace_back(i * Step, i);
             expect(hamt::Check(m) >> fatal) << "after inserting" << i;
         }
@@ -299,7 +299,7 @@ int main() {
         hamt::Map base{};
         Bindings expected;
         for (uint64_t i = 1; i <= N; ++i) {
-            base = hamt::Set(std::move(base), i * Step, i);
+            base = hamt::InsertOrAssign(std::move(base), i * Step, i);
             expected.emplace_back(i * Step, i);
         }
         expect(hamt::Check(base) >> fatal);
@@ -309,7 +309,7 @@ int main() {
         // A key below 2^32 hashes to itself, so each of these diverges at its lowest set bit: one at
         // the root's own level, one a level under it, and one far enough down to need a chain.
         for (const uint64_t key : {uint64_t{1} << 11, uint64_t{32}, uint64_t{1}}) {
-            const auto grown = hamt::Set(base, key, key);
+            const auto grown = hamt::InsertOrAssign(base, key, key);
             expect(hamt::Check(grown) >> fatal) << "after inserting" << key;
             expect(grown.Size == N + 1);
             expect(Holds(grown, key, key));
@@ -347,7 +347,7 @@ int main() {
                     theirs = theirs.update_if_exists(key, bump);
                     break;
                 default:
-                    ours = hamt::Set(ours, key, i);
+                    ours = hamt::InsertOrAssign(ours, key, i);
                     theirs = theirs.set(key, i);
                     break;
             }
@@ -369,7 +369,7 @@ int main() {
         hamt::Map ours{};
         for (uint64_t i = 0; i < 5'000; ++i) {
             const auto key = key_dist(rng);
-            ours = rng() % 2 ? hamt::Set(std::move(ours), key, i) : hamt::Erase(std::move(ours), key);
+            ours = rng() % 2 ? hamt::InsertOrAssign(std::move(ours), key, i) : hamt::Erase(std::move(ours), key);
             expect(hamt::Check(ours) >> fatal) << "after op" << i;
         }
         auto miscounted = ours; // The check has to be able to fail, so hand it something it should reject.
@@ -386,7 +386,7 @@ int main() {
         immer::map<uint64_t, uint64_t> theirs;
         for (uint64_t i = 0; i < 2'000; ++i) {
             const auto key = key_dist(rng);
-            ours = hamt::Set(std::move(ours), key, i);
+            ours = hamt::InsertOrAssign(std::move(ours), key, i);
             theirs = theirs.set(key, i);
         }
         const auto ours_snapshot = ours;
@@ -398,7 +398,7 @@ int main() {
                 ours = hamt::Erase(std::move(ours), key);
                 theirs = theirs.erase(key);
             } else {
-                ours = hamt::Set(std::move(ours), key, i);
+                ours = hamt::InsertOrAssign(std::move(ours), key, i);
                 theirs = theirs.set(key, i);
             }
         }
@@ -412,13 +412,13 @@ int main() {
         // The walk keeps yielding the bindings the map had when it began, even as that map is rebound.
         constexpr uint64_t N = 200;
         hamt::Map m{};
-        for (uint64_t i = 0; i < N; ++i) m = hamt::Set(std::move(m), i * 3, i);
+        for (uint64_t i = 0; i < N; ++i) m = hamt::InsertOrAssign(std::move(m), i * 3, i);
 
         uint64_t seen = 0;
         for (auto it = hamt::begin(m); it != hamt::end(m); ++it) {
             expect(it->Value == it->Key / 3) << "the walk saw a rebound entry"; // Not the value below.
             ++seen;
-            m = hamt::Set(std::move(m), it->Key, it->Value + 1'000); // Rebinds a key under the walk.
+            m = hamt::InsertOrAssign(std::move(m), it->Key, it->Value + 1'000); // Rebinds a key under the walk.
         }
         expect(seen == N);
         for (uint64_t i = 0; i < N; ++i) expect(Holds(m, i * 3, i + 1'000));
@@ -429,13 +429,13 @@ int main() {
         expect(Diffed(empty, empty).empty());
 
         hamt::Map m{};
-        for (uint64_t i = 0; i < 500; ++i) m = hamt::Set(std::move(m), i * 37, i);
+        for (uint64_t i = 0; i < 500; ++i) m = hamt::InsertOrAssign(std::move(m), i * 37, i);
         expect(Diffed(m, m).empty()) << "a map against itself";
         expect(Diffs(empty, m)) << "everything against nothing";
 
         // One binding at a time, so each of the three kinds of change is pinned down on its own.
-        expect(IsOnly(Diffed(m, hamt::Set(m, 1, 1)), {1, std::nullopt, 1})) << "a key added";
-        expect(IsOnly(Diffed(m, hamt::Set(m, 0, 9)), {0, 0, 9})) << "a value rebound";
+        expect(IsOnly(Diffed(m, hamt::InsertOrAssign(m, 1, 1)), {1, std::nullopt, 1})) << "a key added";
+        expect(IsOnly(Diffed(m, hamt::InsertOrAssign(m, 0, 9)), {0, 0, 9})) << "a value rebound";
         expect(IsOnly(Diffed(m, hamt::Erase(m, 37)), {37, 1, std::nullopt})) << "a key removed";
 
         // Maps that share history, and maps built separately from overlapping keys, which share none.
@@ -445,23 +445,23 @@ int main() {
             auto b = m;
             for (uint64_t i = 0; i < round; ++i) {
                 const auto key = key_dist(rng) * 37;
-                b = rng() % 3 ? hamt::Set(std::move(b), key, rng()) : hamt::Erase(std::move(b), key);
+                b = rng() % 3 ? hamt::InsertOrAssign(std::move(b), key, rng()) : hamt::Erase(std::move(b), key);
             }
             expect(Diffs(m, b) >> fatal) << "after" << round << "edits";
         }
 
         hamt::Map twin{};
-        for (uint64_t i = 250; i < 750; ++i) twin = hamt::Set(std::move(twin), i * 37, i + 1);
+        for (uint64_t i = 250; i < 750; ++i) twin = hamt::InsertOrAssign(std::move(twin), i * 37, i + 1);
         expect(Diffs(m, twin)) << "no shared structure, half the keys in common";
 
         // Roots at different levels, which only aligning them can get right: `deep`'s keys agree over
         // twelve low bits and hold its root above them, and the other two do not.
         constexpr uint64_t Step = 0x1000100000000000ull;
         hamt::Map deep{};
-        for (uint64_t i = 1; i <= 8; ++i) deep = hamt::Set(std::move(deep), i * Step, i);
+        for (uint64_t i = 1; i <= 8; ++i) deep = hamt::InsertOrAssign(std::move(deep), i * Step, i);
         expect((deep.Shift > 0u) >> fatal);
-        expect(Diffs(deep, hamt::Set(deep, 1, 1))) << "a key diverging below the root";
-        expect(Diffs(deep, hamt::Set(deep, 32, 32))) << "a key diverging one level under the root";
+        expect(Diffs(deep, hamt::InsertOrAssign(deep, 1, 1))) << "a key diverging below the root";
+        expect(Diffs(deep, hamt::InsertOrAssign(deep, 32, 32))) << "a key diverging one level under the root";
         expect(Diffs(deep, m)) << "no key in common, and roots at different levels";
         expect(Diffs(deep, hamt::Erase(deep, Step))) << "still deep, one key fewer";
     };
@@ -475,7 +475,7 @@ int main() {
             hamt::Map m{};
             for (uint64_t i = 0; i < N; ++i) {
                 keys.push_back(rng());
-                m = hamt::Set(std::move(m), keys.back(), i); // Moved, so paths are reused in place.
+                m = hamt::InsertOrAssign(std::move(m), keys.back(), i); // Moved, so paths are reused in place.
             }
             const auto shared = m; // So every erase below has to copy its path instead.
             for (const auto key : keys) m = hamt::Erase(m, key);

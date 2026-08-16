@@ -33,16 +33,19 @@ struct Map {
     ~Map();
     Map &operator=(Map);
 
-    // The map holding every one of `entries`, or all of `[first, last)`, where a repeated key ends up
-    // as a repeated `Set` would leave it. Any iterator over something with a `Key` and a `Value` will do.
+    // The map holding every one of `entries`, or all of `[first, last)`, where a repeated key ends up as
+    // a repeated `InsertOrAssign` would leave it. Any iterator over something with a `Key` and a `Value`
+    // will do.
     Map(std::initializer_list<Entry> entries);
     template<typename It> Map(It first, const It &last);
 };
 
 // Every write takes the map by value, so move into one when the old map is done with and it will be
 // reused rather than copied.
-// The map with `key` bound to `value`. Rebinding an existing key replaces its value.
-Map Set(Map m, uint64_t key, uint64_t value);
+// The map with `key` bound to `value`. Rebinding an existing key replaces its value, which is why this
+// is not `Insert`: the standard library's insert leaves an existing key alone, and `insert_or_assign` is
+// the one that does what this does.
+Map InsertOrAssign(Map m, uint64_t key, uint64_t value);
 // The map without `key`. A miss returns the map unchanged.
 Map Erase(Map m, uint64_t key);
 
@@ -57,19 +60,19 @@ Map Build(const Entry *first, const Entry *last);
 template<typename It>
 concept EntryRange = std::contiguous_iterator<It> && std::same_as<std::iter_value_t<It>, Entry>;
 
-// Out of the struct, since a body written inside the class cannot see `Set`, declared after it. A
-// non-contiguous iterator has to be walked to be read, so that case inserts one at a time.
+// Out of the struct, since a body written inside the class cannot see `InsertOrAssign`, declared after
+// it. A non-contiguous iterator has to be walked to be read, so that case inserts one at a time.
 template<typename It> Map::Map(It first, const It &last) {
     if constexpr (EntryRange<It>) {
         const Entry *begin = first == last ? nullptr : &*first;
         *this = Build(begin, begin + (last - first));
     } else {
-        for (; first != last; ++first) *this = Set(std::move(*this), first->Key, first->Value);
+        for (; first != last; ++first) *this = InsertOrAssign(std::move(*this), first->Key, first->Value);
     }
 }
 inline Map::Map(std::initializer_list<Entry> entries) : Map(entries.begin(), entries.end()) {}
 // The map with `key` bound to `fn` of the value it holds now, or of zero when it holds none, as
-// immer's `update` does. One descent rather than the two a `Get` and a `Set` take.
+// immer's `update` does. One descent rather than the two a `Get` and an `InsertOrAssign` take.
 Map Update(Map m, uint64_t key, uint64_t (*fn)(void *context, uint64_t current), void *context);
 // The same, except that a key the map does not hold leaves it unchanged and `fn` uncalled.
 Map UpdateIfExists(Map m, uint64_t key, uint64_t (*fn)(void *context, uint64_t current), void *context);

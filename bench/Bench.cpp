@@ -54,7 +54,7 @@ std::vector<uint64_t> Keys(uint64_t n, Pattern p, uint64_t run) {
 
 hamt::Map Built(const std::vector<uint64_t> &keys) {
     hamt::Map m{};
-    for (uint64_t i = 0; i < keys.size(); ++i) m = hamt::Set(std::move(m), keys[i], i);
+    for (uint64_t i = 0; i < keys.size(); ++i) m = hamt::InsertOrAssign(std::move(m), keys[i], i);
     return m;
 }
 
@@ -86,7 +86,7 @@ void Run(uint64_t n, Pattern pattern) {
     std::printf("  %-14s %8s %8s %9s\n", "", "ours", "immer", "ours vs");
 
     Row("build copy",
-        Time(n, [&] { hamt::Map m{}; for (uint64_t i = 0; i < n; ++i) m = hamt::Set(m, keys[i], i); return m.Size; }),
+        Time(n, [&] { hamt::Map m{}; for (uint64_t i = 0; i < n; ++i) m = hamt::InsertOrAssign(m, keys[i], i); return m.Size; }),
         Time(n, [&] { ImmerMap m; for (uint64_t i = 0; i < n; ++i) m = m.set(keys[i], i); return m.size(); }));
     Row("build move",
         Time(n, [&] { return Built(keys).Size; }),
@@ -136,7 +136,7 @@ void Run(uint64_t n, Pattern pattern) {
     auto ours_edited = ours;
     auto theirs_edited = theirs;
     for (uint64_t i = 0; i < edits; ++i) {
-        ours_edited = hamt::Set(std::move(ours_edited), keys[i * edit_stride], ~i);
+        ours_edited = hamt::InsertOrAssign(std::move(ours_edited), keys[i * edit_stride], ~i);
         theirs_edited = theirs_edited.set(keys[i * edit_stride], ~i);
     }
     const auto our_diff = [](const hamt::Map &x, const hamt::Map &y) { uint64_t s = 0; hamt::Diff(x, y, [&s](const hamt::Change &c) { s += c.Key; }); return s; };

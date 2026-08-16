@@ -257,16 +257,16 @@ const Node *Merged(Entry a, uint64_t ha, Entry b, uint64_t hb, uint32_t shift) {
     return n;
 }
 
-struct SetResult {
+struct BindResult {
     const Node *Root;
     bool Added;
 };
 
 // `owned` means every node from the root down to `n` is named exactly once, so rewriting in place is
 // unobservable, and returning `n` leaves the path above untouched. `value` says what to store given what
-// the key holds now, or null when it holds nothing -- where `Set` and `Update` part company. It folds
-// away per instantiation, so `Set` compiles as it did before `Update`.
-template<typename F> SetResult DoSet(const Node *n, uint64_t key, F value, uint64_t hash, uint32_t shift, bool owned) {
+// the key holds now, or null when it holds nothing -- where `InsertOrAssign` and `Update` part company.
+// It folds away per instantiation, so `InsertOrAssign` compiles as it did before `Update`.
+template<typename F> BindResult DoBind(const Node *n, uint64_t key, F value, uint64_t hash, uint32_t shift, bool owned) {
     const Bitmap bit = Bitmap{1} << Idx(hash, shift);
     if (n->Datamap & bit) {
         const auto off = DataOffset(*n, bit);
@@ -277,7 +277,7 @@ template<typename F> SetResult DoSet(const Node *n, uint64_t key, F value, uint6
     if (n->Nodemap & bit) {
         const auto off = ChildOffset(*n, bit);
         const auto *child = Children(n)[off];
-        const auto r = DoSet(child, key, value, hash, shift + Bits, owned && child->Refs == 1);
+        const auto r = DoBind(child, key, value, hash, shift + Bits, owned && child->Refs == 1);
         return {WithChild(n, off, child, r.Root, owned), r.Added};
     }
     return {WithEntryInserted(n, bit, {key, value(nullptr)}), true};
@@ -563,14 +563,14 @@ Map Grown(Map m, Entry e, uint64_t hash, uint32_t shift) {
     return {root, m.Size + 1, m.Prefix & ((uint64_t{1} << shift) - 1), shift};
 }
 
-// The whole of a write that can add a key. `Set` reaches it with a constant and `Update` with a
-// function of the binding it displaces, and nothing from here down knows the difference.
-template<typename F> Map SetWith(Map m, uint64_t key, F value) {
+// The whole of a write that can add a key. `InsertOrAssign` reaches it with a constant and `Update` with
+// a function of the binding it displaces, and nothing from here down knows the difference.
+template<typename F> Map BindWith(Map m, uint64_t key, F value) {
     const auto hash = Hash(key);
     if (!m.Root) return Lone({key, value(nullptr)});
     // A key that disagrees over the bits the root skips belongs above the root, not under it.
     if (const auto diff = (hash ^ m.Prefix) & ((uint64_t{1} << m.Shift) - 1)) return Grown(std::move(m), {key, value(nullptr)}, hash, uint32_t(std::countr_zero(diff)) / Bits * Bits);
-    const auto r = DoSet(m.Root, key, value, hash, m.Shift, m.Root->Refs == 1);
+    const auto r = DoBind(m.Root, key, value, hash, m.Shift, m.Root->Refs == 1);
     auto out = WithRoot(std::move(m), r.Root);
     out.Size += r.Added;
     // Promoting the entry of a map that held only one leaves a root with a single child, and the
@@ -595,7 +595,7 @@ Piece Assemble(Entry *from, Entry *to, uint64_t n, uint32_t shift, uint64_t &pla
         return {nullptr, from[0]};
     }
     // Agreeing on all 64 bits is agreeing on the key, since the fold is a bijection. So these are
-    // repeats of one key, and the last of them wins as it would through a repeated `Set`.
+    // repeats of one key, and the last of them wins as it would through a repeated `InsertOrAssign`.
     if (shift >= 64) {
         ++placed;
         return {nullptr, from[n - 1]};
@@ -650,12 +650,12 @@ Map Build(const Entry *first, const Entry *last) {
     return m;
 }
 
-Map Set(Map m, uint64_t key, uint64_t value) {
-    return SetWith(std::move(m), key, [value](const uint64_t *) { return value; });
+Map InsertOrAssign(Map m, uint64_t key, uint64_t value) {
+    return BindWith(std::move(m), key, [value](const uint64_t *) { return value; });
 }
 
 Map Update(Map m, uint64_t key, uint64_t (*fn)(void *, uint64_t), void *context) {
-    return SetWith(std::move(m), key, [fn, context](const uint64_t *current) { return fn(context, current ? *current : 0); });
+    return BindWith(std::move(m), key, [fn, context](const uint64_t *current) { return fn(context, current ? *current : 0); });
 }
 
 Map UpdateIfExists(Map m, uint64_t key, uint64_t (*fn)(void *, uint64_t), void *context) {
