@@ -30,6 +30,23 @@ foreach(lib hamt hamt_audit)
 endforeach()
 target_compile_definitions(hamt_audit PRIVATE HAMT_AUDIT)
 
+# The vector's branching factor. A wider node makes the trie shallower, and a level is a dependent load:
+# at a hundred thousand elements 6 reaches a chunk in three loads where 5 takes four, worth 20% on a
+# random index and as much again on a write, over nodes twice as wide to copy.
+#
+# Two rows go the other way. A cut claims every child it keeps, and a wider node has twice as many per
+# level for one level fewer, so `take` runs about 1.5x slower. A push that has to leave its vector alone
+# copies the tail, which is twice the bytes. Set this to 5 for a workload made of those two.
+set(VECTOR_BITS 6 CACHE STRING "Trie branching factor exponent: 5 for 32 slots per node, 6 for 64.")
+
+# The same source twice, for the same reason as the map's: `vec_audit` drops the node free list.
+foreach(lib vec vec_audit)
+    add_library(${lib} src/Vector.cpp)
+    target_include_directories(${lib} PUBLIC src)
+    target_compile_definitions(${lib} PRIVATE VECTOR_BITS=${VECTOR_BITS})
+endforeach()
+target_compile_definitions(vec_audit PRIVATE VECTOR_AUDIT)
+
 # immer, the reference implementation, for the tests and the benchmark to measure against. Plain -I
 # rather than SYSTEM: Apple clang searches /usr/local/include ahead of -isystem dirs, so any immer
 # installed there would shadow the submodule. Its warnings are silenced at the include site instead.

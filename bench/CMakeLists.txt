@@ -1,2 +1,4 @@
 add_executable(HamtBench Bench.cpp)
 target_link_libraries(HamtBench PRIVATE hamt immer_reference)
+add_executable(VectorBench VectorBench.cpp)
+target_link_libraries(VectorBench PRIVATE vec immer_reference)

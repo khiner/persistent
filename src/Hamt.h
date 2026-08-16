@@ -1,10 +1,11 @@
 #pragma once
 
+#include "Erased.h"
+
 #include <cstdint>
 #include <initializer_list>
 #include <iterator>
 #include <optional>
-#include <type_traits>
 #include <utility>
 
 namespace hamt {
@@ -67,13 +68,6 @@ template<typename It> Map::Map(It first, It last) {
     }
 }
 inline Map::Map(std::initializer_list<Entry> entries) : Map(entries.begin(), entries.end()) {}
-// How a callable reaches the compiled walks: a function pointer and a `void *` standing for it, so
-// nothing is allocated and the walk stays out of this header. `const` is lost only for the hop.
-namespace erased {
-template<typename F> void *Context(F &&fn) { return const_cast<std::remove_const_t<std::remove_reference_t<F>> *>(&fn); }
-template<typename R, typename F, typename... Args> R Call(void *context, Args... args) { return (*static_cast<std::remove_reference_t<F> *>(context))(args...); }
-} // namespace erased
-
 // The map with `key` bound to `fn` of the value it holds now, or of zero when it holds none, as
 // immer's `update` does. One descent rather than the two a `Get` and a `Set` take.
 Map Update(Map m, uint64_t key, uint64_t (*fn)(void *context, uint64_t current), void *context);

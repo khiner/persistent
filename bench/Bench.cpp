@@ -2,6 +2,7 @@
 //   cmake --build build --target HamtBench && ./build/bench/HamtBench
 // Sweep the branching factor by configuring a second build dir with -DHAMT_BITS=6.
 
+#include "Bench.h"
 #include "Hamt.h"
 
 // immer is not included as a system header (see the top-level CMakeLists.txt), so silence its warnings.
@@ -13,11 +14,7 @@
 #include <immer/map_transient.hpp>
 #pragma clang diagnostic pop
 
-#include <pthread.h>
-
 #include <cctype>
-#include <chrono>
-#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <iterator>
@@ -27,38 +24,8 @@
 #include <vector>
 
 namespace {
-using Clock = std::chrono::steady_clock;
+using namespace bench;
 using ImmerMap = immer::map<uint64_t, uint64_t>;
-
-// Nanoseconds per operation, best of `Rounds`, since timing noise only ever adds. `Sink` keeps the
-// optimizer from deleting the work. A round repeats until it has run for `MinRoundNanos`, then divides,
-// which is what makes the small sizes comparable: a thousand lookups alone are close enough to the
-// clock's own cost to be mostly noise. `HAMT_BENCH_ROUNDS` buys steadiness with wall clock -- nine to
-// read one cell closely -- but does not steady the summary a change is judged on, so three is default.
-const uint32_t Rounds = [] {
-    const auto *rounds = std::getenv("HAMT_BENCH_ROUNDS");
-    const auto n = rounds ? std::strtoul(rounds, nullptr, 10) : 0;
-    return n ? uint32_t(n) : 3;
-}();
-constexpr double MinRoundNanos = 2e6;
-uint64_t Sink = 0;
-
-template<typename F> double Time(uint64_t ops, F &&f) {
-    double best = 1e300;
-    for (uint32_t i = 0; i < Rounds; ++i) {
-        uint64_t reps = 0;
-        double ns;
-        const auto start = Clock::now();
-        do {
-            Sink += f();
-            ++reps;
-            ns = std::chrono::duration<double, std::nano>(Clock::now() - start).count();
-        } while (ns < MinRoundNanos);
-        const auto per_op = ns / double(ops * reps);
-        best = per_op < best ? per_op : best;
-    }
-    return best;
-}
 
 // Key shape matters as much as key count. immer feeds the key straight to the trie, so a dense key set
 // gives it a dense trie and one with zeroed low bits wastes whole levels. Our fold leaves both alone,
@@ -95,19 +62,6 @@ ImmerMap ImmerBuilt(const std::vector<uint64_t> &keys) {
     auto t = ImmerMap{}.transient();
     for (uint64_t i = 0; i < keys.size(); ++i) t.set(keys[i], i);
     return t.persistent();
-}
-
-// The sweep's verdict, over every row it prints. One cell's margin moves on nothing but where the
-// linker put the code, which rerunning the same binary does not resample, so a single cell is not
-// evidence. The mean holds steadier, since a layout that costs one cell pays another back.
-double LogRatios = 0;
-uint32_t Cells = 0, Behind = 0;
-
-void Row(const char *name, double ours, double immer) {
-    std::printf("  %-14s %8.2f %8.2f   %+6.1f%%\n", name, ours, immer, 100 * (immer - ours) / immer);
-    LogRatios += std::log(immer / ours);
-    Behind += ours > immer;
-    ++Cells;
 }
 
 void Run(uint64_t n, Pattern pattern) {
@@ -198,15 +152,12 @@ void Run(uint64_t n, Pattern pattern) {
 } // namespace
 
 int main(int argc, char **argv) {
-    // Apple silicon runs a plain process on whichever core is free, and an efficiency core is about half
-    // as fast here, so without this the readings are bimodal.
-    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
-    std::printf("ns/op, lower is better. Last column is our margin over immer.\n");
+    bench::Begin();
     // An optional leading key pattern, then sizes.
     //   HamtBench                     the three default sizes on random keys
     //   HamtBench sequential 1000000  one size, one pattern
     //   HamtBench all 100000          every pattern at one size
-    //   HAMT_BENCH_ROUNDS=9 HamtBench all   three times the work, for reading one cell closely
+    //   BENCH_ROUNDS=9 HamtBench all         three times the work, for reading one cell closely
     int arg = 1;
     std::vector<Pattern> patterns{Pattern::Random};
     if (argc > 1 && !std::isdigit(static_cast<unsigned char>(argv[1][0]))) {
@@ -228,5 +179,5 @@ int main(int argc, char **argv) {
             for (const uint64_t n : {uint64_t{1'000}, uint64_t{100'000}, uint64_t{1'000'000}}) Run(n, pattern);
         }
     }
-    std::printf("\n%u cells, %u behind immer, geometric mean %+.1f%%  (checksum %llu)\n", Cells, Behind, 100 * (1 - std::exp(-LogRatios / Cells)), (unsigned long long)Sink);
+    bench::End();
 }

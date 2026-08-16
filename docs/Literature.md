@@ -93,13 +93,23 @@ The addon we care about most after the map itself.
 
 ## 8. Other structures, for later
 
-- **Sequences.** [RRB-Trees](https://infoscience.epfl.ch/record/169879) (Bagwell & Rompf 2011) → [RRB Vector](https://dl.acm.org/doi/10.1145/2858949.2784739) (Stucki et al., ICFP 2015) → immer ICFP 2017 → Scala's [Vector rewrite](https://github.com/scala/scala/pull/8534). Practical lesson from the last: fixed fingers at *both* ends, as part of the structure, beat a single movable tail treated as a transient optimization. Background: [hypirion's persistent vector series](https://hypirion.com/musings/understanding-persistent-vector-pt-1).
+- **Relaxed sequences.** [RRB-Trees](https://infoscience.epfl.ch/record/169879) (Bagwell & Rompf 2011) → [RRB Vector](https://dl.acm.org/doi/10.1145/2858949.2784739) (Stucki et al., ICFP 2015) → immer ICFP 2017 → Scala's [Vector rewrite](https://github.com/scala/scala/pull/8534). Where §9's strict vector ends: allow a partly filled node, give it a table of cumulative subtree sizes, and concatenation, insertion and slicing become logarithmic, at the cost of a search per level on every index. The rebalancing rule on concatenation — how much slack a merged spine may keep before it is redistributed — is the whole difficulty, and it is what Stucki et al. get right and Bagwell & Rompf state loosely. Scala's practical lesson: fixed fingers at *both* ends, as part of the structure, beat a single movable tail treated as a transient optimization.
 - **Ordered maps.** [Rodeh, _B-trees, Shadowing, and Clones_](https://archive.kernel.org/oldwiki/btrfs.wiki.kernel.org/images-btrfs/6/68/Btree_TOS.pdf) (TOS 2008) — the COW B-tree behind btrfs/ZFS/LMDB. [Tonsky's persistent-sorted-set](https://github.com/tonsky/persistent-sorted-set) and [DataScript internals](https://tonsky.me/blog/datascript-internals/) — a persistent B+ tree that beats a red-black tree ~3x on range scans because nodes are contiguous arrays. [Stratified B-trees](https://arxiv.org/pdf/1103.4282) for fully-persistent external dictionaries.
 - **Write-optimized.** [Hitchhiker trees](https://github.com/replikativ/hitchhiker-tree) (Greenberg, Strange Loop 2016), [intro](https://blog.datopia.org/2018/11/03/hitchhiker-tree/) — B+ tree with per-node append buffers so most writes touch only the root, then path-copy. The batching idea if we ever want cheap bulk updates.
 - **Bulk operations.** [Blelloch, Ferizovic & Sun, _Just Join for Parallel Ordered Sets_](https://www.cs.cmu.edu/~blelloch/papers/BFS16.pdf) (SPAA 2016) and [_PAM_](https://arxiv.org/pdf/1612.05665) (PPoPP 2018). Union / intersection / difference with optimal work on persistent trees, all from a single `join` primitive. The trie analogue is a recursive node-wise merge with pointer-equality short-circuit — structurally the same recursion as diff. Read this before designing `merge`/`union`, not the CHAMP papers.
 - **Theory.** [_Confluently Persistent Sets and Maps_](https://arxiv.org/pdf/1301.3388) for merge/diff complexity bounds. _Verified Persistent Catenable Deques_ (JFLA 2026) if we ever want a deque.
 
-## 9. State of the art, as of 2026
+## 9. The strict vector
+
+The other structure implemented here: a trie indexed by the bits of the index itself rather than of a hash, with every level full but the rightmost path, so an index is a path and no node is searched.
+
+- **Clojure `PersistentVector`** — the reference. 32-way radix balanced trie, plus the **tail**: the last partial chunk held beside the trie rather than in it, so an append writes one node and reaches the trie once per chunk, and the trie itself always holds a whole number of chunks. [hypirion's series](https://hypirion.com/musings/understanding-persistent-vector-pt-1) is the clearest account.
+- **Bolívar Puente, ICFP 2017** (§1) — the C++ account. Its `vector` is this structure and its `flex_vector` is §8's, both over one node type, which is why a `vector` converts to a `flex_vector` in constant time and not the reverse.
+- **Bagwell, _Ideal Hash Trees_** (§1) — the trie this descends from. What the vector drops is the hash and the bitmap: an index needs no mixing, and a dense node needs no popcount to find a slot.
+
+What differs from the map is worth stating, because it decides the layout. A map node is packed to the slots it uses and reached through a bitmap; a vector node is dense and indexed straight, and its depth is a function of the size alone rather than of how the keys fall. That makes the branching factor a plain trade: a wider node is a shallower trie, which is one fewer dependent load per read, and it is more bytes to copy on a write and more children to claim on a cut. Both halves are measurable, which is what `VECTOR_BITS` is for.
+
+## 10. State of the art, as of 2026
 
 Nothing substantive has been published on CHAMP itself since the 2018 HHAMT paper. The design is settled and recent activity is entirely in implementations (Scala 2.13, Clojure, Rust, Pony 2026). Where the field *has* moved is adjacent:
 - content-addressed / history-independent structures for **diff and reconciliation** between unrelated versions (prolly trees, MSTs, range-based reconciliation),
