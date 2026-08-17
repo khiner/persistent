@@ -21,7 +21,7 @@ Reported 1.3–6.7x iteration and 3–25.4x equality over HAMT, with a smaller f
 The long form. Worth it for the node-layout arithmetic, the memory-footprint methodology, and the delete/compaction rules stated precisely — the OOPSLA paper compresses these.
 
 **Steindorfer & Vinju, HHAMT — [_To-Many or To-One? All-in-One!_](https://michael.steindorfer.name/publications/pldi18.pdf) (PLDI 2018), [arXiv 1608.01036](https://arxiv.org/pdf/1608.01036).**
-Heterogeneous payloads via an extra bitmap per node, so one node type serves set / map / multimap and small values can live unboxed. Relevant if we later want `Set` and `Map` to share one node implementation rather than templating twice.
+Heterogeneous payloads via an extra bitmap per node, so one node type serves set / map / multimap and small values can live unboxed. `Set` and `Map` are two instantiations of one trie instead, which shares the code and the allocator but still compiles a node walk apiece. This is what a single node implementation would take.
 
 **Bolívar Puente, [_Persistence for the Masses: RRB-Vectors in a Systems Language_](https://public.sinusoid.es/misc/immer/immer-icfp17.pdf) (ICFP 2017).**
 immer's own paper. Nominally about vectors, but the valuable half for us is the treatment of memory policies, refcounting, and transients — the only paper in this list written about doing this in C++ with no GC, which is our exact constraint.

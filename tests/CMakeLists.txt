@@ -8,6 +8,13 @@ endforeach()
 target_link_libraries(HamtTest PRIVATE hamt)
 target_link_libraries(HamtAuditTest PRIVATE hamt_audit)
 
+foreach(test SetTest SetAuditTest)
+    add_executable(${test} SetTest.cpp)
+    target_link_libraries(${test} PRIVATE immer_reference Boost::ut)
+endforeach()
+target_link_libraries(SetTest PRIVATE hamt)
+target_link_libraries(SetAuditTest PRIVATE hamt_audit)
+
 foreach(test VectorTest VectorAuditTest)
     add_executable(${test} VectorTest.cpp)
     target_link_libraries(${test} PRIVATE immer_reference Boost::ut)
