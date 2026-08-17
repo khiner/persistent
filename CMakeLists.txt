@@ -47,6 +47,10 @@ foreach(lib vec vec_audit)
 endforeach()
 target_compile_definitions(vec_audit PRIVATE VECTOR_AUDIT)
 
+# The box is header-only, so this target carries the include path and nothing else.
+add_library(box INTERFACE)
+target_include_directories(box INTERFACE src)
+
 # immer, the reference implementation, for the tests and the benchmark to measure against. Plain -I
 # rather than SYSTEM: Apple clang searches /usr/local/include ahead of -isystem dirs, so any immer
 # installed there would shadow the submodule. Its warnings are silenced at the include site instead.
