@@ -95,6 +95,29 @@ int main() {
         expect(!hamt::Contains(s, 42));
     };
 
+    "transient"_test = [] {
+        const hamt::Set original{1, 2};
+        auto t = original.transient();
+        expect(t.size() == 2_u64 && !t.empty());
+        expect(t.count(1) == 1_u64 && t.count(9) == 0_u64);
+        expect(t.find(2) && *t.find(2) == 2_u64);
+        t.insert(3);
+        t.insert(3);
+        t.erase(1);
+        const auto snapshot = t.persistent();
+        expect(hamt::Check(snapshot) >> fatal);
+        expect(snapshot.Size == 2_u64 && hamt::Contains(snapshot, 2) && hamt::Contains(snapshot, 3));
+        expect(hamt::Contains(original, 1) && !hamt::Contains(original, 3));
+
+        t.insert(4);
+        expect(!hamt::Contains(snapshot, 4));
+        const auto finished = std::move(t).persistent();
+        expect(hamt::Contains(finished, 4));
+        uint64_t visited = 0;
+        for (const auto key : finished.transient()) visited += key;
+        expect(visited == 9_u64);
+    };
+
     "insert and contains"_test = [] {
         auto s = hamt::Insert({}, 1);
         s = hamt::Insert(s, 2);

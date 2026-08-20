@@ -126,6 +126,33 @@ int main() {
         expect(Holds(vec::Concat(v, v), Values{}));
     };
 
+    "transient"_test = [] {
+        const vec::FlexVector original{1, 2, 3, 4};
+        auto t = original.transient();
+        t.drop(1);
+        t.take(2);
+        t.push_back(40);
+        t.set(0, 20);
+        t.update(1, [](uint64_t value) { return value * 10; });
+        const auto snapshot = t.persistent();
+        expect((snapshot == vec::FlexVector{20, 30, 40}) >> fatal);
+        expect(original == vec::FlexVector{1, 2, 3, 4});
+
+        auto right = vec::FlexVector{50, 60}.transient();
+        t.append(right);
+        auto left = vec::FlexVector{10}.transient();
+        t.prepend(std::move(left));
+        expect(std::move(right).persistent() == vec::FlexVector{50, 60});
+        const auto finished = std::move(t).persistent();
+        expect(vec::Check(finished) >> fatal);
+        expect(finished == vec::FlexVector{10, 20, 30, 40, 50, 60});
+        expect(snapshot == vec::FlexVector{20, 30, 40});
+
+        vec::FlexVectorTransient widened{vec::Vector{7, 8}.transient()};
+        widened.push_back(9);
+        expect(std::move(widened).persistent() == vec::FlexVector{7, 8, 9});
+    };
+
     "from a strict vector"_test = [] {
         // The conversion is a retain and nothing else, so shape and elements both carry over.
         for (const auto n : Sizes) {

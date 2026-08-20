@@ -103,6 +103,35 @@ int main() {
         expect(hamt::Get(m, 42) == nullptr);
     };
 
+    "transient"_test = [] {
+        const hamt::Map original{{1, 10}, {2, 20}};
+        auto t = original.transient();
+        expect(t.size() == 2_u64);
+        expect(!t.empty());
+        expect(t.count(1) == 1_u64 && t.count(9) == 0_u64);
+        expect(t.find(2) && *t.find(2) == 20_u64);
+        expect(t[9] == 0_u64);
+
+        t.set(1, 11);
+        t.insert({3, 30});
+        t.update(2, [](uint64_t value) { return value + 2; });
+        t.update(4, [](uint64_t value) { return value + 40; });
+        t.update_if_exists(9, [](uint64_t value) { return value + 1; });
+        t.erase(3);
+        const auto snapshot = t.persistent();
+        expect(hamt::Check(snapshot) >> fatal);
+        expect(Holds(snapshot, 1, 11) && Holds(snapshot, 2, 22) && Holds(snapshot, 4, 40));
+        expect(Holds(original, 1, 10) && original.Size == 2_u64);
+
+        t.set(1, 100);
+        expect(Holds(snapshot, 1, 11));
+        const auto finished = std::move(t).persistent();
+        expect(Holds(finished, 1, 100));
+        uint64_t visited = 0;
+        for (const auto &entry : original.transient()) visited += entry.Value;
+        expect(visited == 30_u64);
+    };
+
     "set and get"_test = [] {
         auto m = hamt::InsertOrAssign({}, 1, 100);
         m = hamt::InsertOrAssign(m, 2, 200);

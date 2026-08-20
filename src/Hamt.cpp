@@ -771,7 +771,8 @@ const uint64_t *Get(const Map &m, uint64_t key) {
     return e ? &e->Value : nullptr;
 }
 
-bool Contains(const Set &s, uint64_t key) { return Find(s, key) != nullptr; }
+const uint64_t *Get(const Set &s, uint64_t key) { return Find<uint64_t>(s, key); }
+bool Contains(const Set &s, uint64_t key) { return Get(s, key) != nullptr; }
 
 template<typename E> void ForEachChunk(const Trie<E> &t, void (*visit)(void *, const E *, const E *), void *context) {
     if (!t.Root) return; // An empty trie has no root, and so calls nothing.

@@ -6,6 +6,7 @@
 #include <initializer_list>
 #include <iterator>
 #include <optional>
+#include <stdexcept>
 #include <utility>
 
 namespace vec {
@@ -21,6 +22,8 @@ enum struct Shape {
     // partly filled node carries a table of running totals, and has to be searched rather than addressed.
     Relaxed,
 };
+
+template<Shape S> struct Transient;
 
 // Persistent vector of 64-bit values, backed by a radix balanced trie with the last partial chunk held
 // outside it. Every operation returns a new vector and leaves its input intact. Two vectors share the
@@ -58,6 +61,12 @@ template<Shape S> struct Trie {
     // The element at `index`, which has to be one the vector holds. The reference lasts as long as this
     // vector holds that element.
     const uint64_t &operator[](uint64_t index) const;
+
+    using transient_type = Transient<S>;
+    // A mutable view over the same copy-on-write vector. The lvalue form preserves this vector and the
+    // rvalue form transfers it, matching immer's two `transient()` affordances.
+    transient_type transient() const &;
+    transient_type transient() &&;
 };
 
 using Vector = Trie<Shape::Strict>;
@@ -201,4 +210,53 @@ struct Iterator {
 
 template<Shape S> Iterator begin(const Trie<S> &v);
 template<Shape S> Iterator end(const Trie<S> &) { return {}; }
+
+// Mutable batching interface over a persistent vector. An lvalue `persistent()` takes a snapshot and
+// leaves the transient usable; the rvalue form hands its contents out.
+template<Shape S> struct Transient {
+    using persistent_type = Trie<S>;
+    using value_type = uint64_t;
+    using size_type = uint64_t;
+    using iterator = Iterator;
+    using const_iterator = iterator;
+
+    Transient() = default;
+    template<Shape O> Transient(Transient<O> v)
+        requires(S == Shape::Relaxed && O == Shape::Strict)
+        : Data(v.Data) {}
+
+    size_type size() const { return Data.Size; }
+    bool empty() const { return Data.Size == 0; }
+    const uint64_t &operator[](uint64_t index) const { return Data[index]; }
+    const uint64_t &at(uint64_t index) const {
+        if (index >= Data.Size) throw std::out_of_range{"vec::Transient::at"};
+        return Data[index];
+    }
+    iterator begin() const { return vec::begin(Data); }
+    iterator end() const { return {}; }
+
+    void push_back(uint64_t value) { Data = PushBack(std::move(Data), value); }
+    void set(uint64_t index, uint64_t value) { Data = Set(std::move(Data), index, value); }
+    template<typename F> void update(uint64_t index, F &&fn) { Data = Update(std::move(Data), index, std::forward<F>(fn)); }
+    void take(uint64_t count) { Data = Take(std::move(Data), count); }
+    void drop(uint64_t count) requires(S == Shape::Relaxed) { Data = Drop(std::move(Data), count); }
+    void append(const Transient &right) requires(S == Shape::Relaxed) { Data = Concat(Data, right.Data); }
+    void prepend(const Transient &left) requires(S == Shape::Relaxed) { Data = Concat(left.Data, Data); }
+
+    persistent_type persistent() & { return Data; }
+    persistent_type persistent() && { return std::move(Data); }
+
+private:
+    template<Shape> friend struct Transient;
+    friend persistent_type;
+    explicit Transient(persistent_type data) : Data(std::move(data)) {}
+
+    persistent_type Data;
+};
+
+using VectorTransient = Transient<Shape::Strict>;
+using FlexVectorTransient = Transient<Shape::Relaxed>;
+
+template<Shape S> auto Trie<S>::transient() const & -> transient_type { return transient_type{*this}; }
+template<Shape S> auto Trie<S>::transient() && -> transient_type { return transient_type{std::move(*this)}; }
 } // namespace vec

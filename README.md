@@ -11,6 +11,8 @@ Five immutable containers in C++23, written from scratch, tested against [immer]
 
 Every operation returns a new container and leaves its input unchanged. Containers share the nodes they have in common, and a node is freed when the last container holding it is. A write given a container as an rvalue — `InsertOrAssign(std::move(m), key, value)` — writes through every node on its path that nothing else holds, and copies the ones that are shared.
 
+All four tries also expose immer-style transients for mutable batches. Call `transient()` on a persistent container, use methods such as `push_back`, `set`, `insert`, `update`, and `erase`, then call `persistent()`. Converting an lvalue preserves it; converting an rvalue transfers it. Calling `persistent()` on a transient lvalue takes a cheap snapshot and leaves the transient usable.
+
 Single threaded: reference counts are plain integers, and the tries race even between two that share nothing, their nodes coming from shared slabs. Clang and libc++ only.
 
 The four tries are compiled against `uint64_t`, so their nodes are one width and come out of a slab allocator. The box is header-only and a template, since the value it holds is the whole point of it, and its cell is one `new`.

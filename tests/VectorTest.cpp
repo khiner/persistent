@@ -89,6 +89,29 @@ int main() {
         expect(v == vec::Vector{});
     };
 
+    "transient"_test = [] {
+        const vec::Vector original{1, 2, 3};
+        auto t = original.transient();
+        expect(t.size() == 3_u64 && !t.empty());
+        expect(t[1] == 2_u64 && t.at(2) == 3_u64);
+        t.push_back(4);
+        t.set(0, 10);
+        t.update(1, [](uint64_t value) { return value * 10; });
+        const auto snapshot = t.persistent();
+        expect((snapshot == vec::Vector{10, 20, 3, 4}) >> fatal);
+        expect(original == vec::Vector{1, 2, 3});
+
+        t.take(3);
+        t.set(2, 30);
+        expect(snapshot == vec::Vector{10, 20, 3, 4});
+        const auto finished = std::move(t).persistent();
+        expect(vec::Check(finished) >> fatal);
+        expect(finished == vec::Vector{10, 20, 30});
+        uint64_t visited = 0;
+        for (const auto value : original.transient()) visited += value;
+        expect(visited == 6_u64);
+    };
+
     "push back"_test = [] {
         // Every size either branching factor makes something of, and the whole vector read back three
         // ways at each of them. Growth is the operation with the most shapes to get wrong.

@@ -6,6 +6,7 @@
 #include <initializer_list>
 #include <iterator>
 #include <optional>
+#include <stdexcept>
 #include <type_traits>
 #include <utility>
 
@@ -15,6 +16,8 @@ struct Node;
 struct Entry {
     uint64_t Key, Value;
 };
+
+template<typename E> struct Transient;
 
 // Persistent trie over 64-bit keys, backed by a hash array mapped trie. Every operation returns a new
 // trie and leaves its input intact, sharing what the two have in common and releasing it once no trie is
@@ -41,6 +44,12 @@ template<typename E> struct Trie {
     // as a repeated write would leave it. Any iterator over the element type will do.
     Trie(std::initializer_list<E> elements);
     template<typename It> Trie(It first, const It &last);
+
+    using transient_type = Transient<E>;
+    // A mutable view over the same copy-on-write trie. An lvalue keeps this trie alive; an rvalue hands
+    // its reference to the transient, just as immer's `transient()` overloads do.
+    transient_type transient() const &;
+    transient_type transient() &&;
 };
 
 using Map = Trie<Entry>;
@@ -94,6 +103,8 @@ template<typename F> Map UpdateIfExists(Map m, uint64_t key, F &&fn) { return Up
 // The value `key` is bound to, or null. It stays put for as long as `m` holds it, so the pointer
 // outlives the call but not an update that displaces the entry. A pointer, so a reader avoids a copy.
 const uint64_t *Get(const Map &m, uint64_t key);
+// The held key itself, or null. The pointer lasts as long as `s` holds the key.
+const uint64_t *Get(const Set &s, uint64_t key);
 // Whether `s` holds `key`. The same walk `Get` makes, with nothing to hand back at the end of it.
 bool Contains(const Set &s, uint64_t key);
 
@@ -188,4 +199,66 @@ template<typename E> struct Iterator {
 
 template<typename E> Iterator<E> begin(const Trie<E> &t);
 template<typename E> Iterator<E> end(const Trie<E> &) { return {}; }
+
+// Mutable batching interface over a persistent trie. An lvalue `persistent()` takes a snapshot and
+// leaves the transient usable; the rvalue form hands its contents out.
+template<typename E> struct Transient {
+    using persistent_type = Trie<E>;
+    using value_type = E;
+    using size_type = uint64_t;
+    using iterator = Iterator<E>;
+    using const_iterator = iterator;
+
+    Transient() = default;
+
+    size_type size() const { return Data.Size; }
+    bool empty() const { return Data.Size == 0; }
+    iterator begin() const { return hamt::begin(Data); }
+    iterator end() const { return {}; }
+
+    size_type count(uint64_t key) const { return find(key) ? 1 : 0; }
+    const uint64_t *find(uint64_t key) const { return Get(Data, key); }
+    const uint64_t &operator[](uint64_t key) const
+        requires(std::is_same_v<E, Entry>) {
+        static constexpr uint64_t Missing{};
+        const auto *found = Get(Data, key);
+        return found ? *found : Missing;
+    }
+    const uint64_t &at(uint64_t key) const
+        requires(std::is_same_v<E, Entry>) {
+        const auto *found = Get(Data, key);
+        if (!found) throw std::out_of_range{"hamt::MapTransient::at"};
+        return *found;
+    }
+
+    void insert(E value) {
+        if constexpr (std::is_same_v<E, Entry>) Data = InsertOrAssign(std::move(Data), value.Key, value.Value);
+        else Data = Insert(std::move(Data), value);
+    }
+    void set(uint64_t key, uint64_t value) requires(std::is_same_v<E, Entry>) {
+        Data = InsertOrAssign(std::move(Data), key, value);
+    }
+    template<typename F> void update(uint64_t key, F &&fn) requires(std::is_same_v<E, Entry>) {
+        Data = Update(std::move(Data), key, std::forward<F>(fn));
+    }
+    template<typename F> void update_if_exists(uint64_t key, F &&fn) requires(std::is_same_v<E, Entry>) {
+        Data = UpdateIfExists(std::move(Data), key, std::forward<F>(fn));
+    }
+    void erase(uint64_t key) { Data = Erase(std::move(Data), key); }
+
+    persistent_type persistent() & { return Data; }
+    persistent_type persistent() && { return std::move(Data); }
+
+private:
+    friend persistent_type;
+    explicit Transient(persistent_type data) : Data(std::move(data)) {}
+
+    persistent_type Data;
+};
+
+using MapTransient = Transient<Entry>;
+using SetTransient = Transient<uint64_t>;
+
+template<typename E> auto Trie<E>::transient() const & -> transient_type { return transient_type{*this}; }
+template<typename E> auto Trie<E>::transient() && -> transient_type { return transient_type{std::move(*this)}; }
 } // namespace hamt
