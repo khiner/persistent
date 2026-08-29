@@ -105,7 +105,7 @@ int main() {
     "moves"_test = [] {
         // `b` is left holding nothing and not read again -- only the destructor may look at a box moved from.
         box::Box<Tracked> b{9};
-        auto *cell = b.Held;
+        const auto *cell = b.Held;
         const auto moved = std::move(b);
         expect((moved.Held == cell) >> fatal) << "a move should hand the cell over, not copy it";
         expect(cell->Refs == 1_u) << "and should not have touched the count";
@@ -164,7 +164,7 @@ int main() {
         // The same, with the cell shared, which has to leave the other holder as it was.
         const auto shared = alone;
         Tracked::Built = 0;
-        auto written = box::Update(std::move(alone), bump);
+        const auto written = box::Update(std::move(alone), bump);
         expect(written->V == 11_u64);
         expect(Tracked::Built == 2_u64) << "a shared cell cannot be written through, so the result needs one of its own";
         expect(written.Held != shared.Held);

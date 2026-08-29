@@ -140,6 +140,26 @@ template<Shape S> const uint64_t &Back(const Trie<S> &v) { return v[v.Size - 1];
 // two share settles a whole subtrie, where the relaxed shape has nothing short of that to go on.
 template<Shape S> bool operator==(const Trie<S> &a, const Trie<S> &b);
 
+// One run the two vectors differ in: `a[Index, Index + Removed)` is replaced by `b[To, To + Added)`.
+// At most one of the two counts is zero.
+struct Change {
+    uint64_t Index, Removed, To, Added;
+};
+
+// Reports every run the two vectors differ in, in order, once each.
+// Costs the depth of the trie for two vectors related by a write, an append, or a cut.
+// The runs are a shortest edit script under Levenshtein's metric, where a `Set` is one edit, up to a few hundred edits between the runs the two share.
+// Past that the runs are still a valid script, and two vectors with nothing in common are reported as one run, which bounds the cost.
+template<Shape S> void Diff(const Trie<S> &a, const Trie<S> &b, void (*report)(void *context, const Change &), void *context);
+// The same, for anything callable with a `const Change &`.
+template<Shape S, typename F> void Diff(const Trie<S> &a, const Trie<S> &b, F &&report) { Diff(a, b, erased::Call<void, F, const Change &>, erased::Context(report)); }
+
+// `a` with each run in `[first, last)` replaced by the elements of `source` the run points to, so `Apply(a, Diff(a, b), b)` is `b`.
+// The runs must be in order and disjoint, as a diff reports them.
+// A change holds indices and no elements, so a `source` other than `b` applies the same change to different elements.
+// Relaxed only, since it moves elements.
+FlexVector Apply(const FlexVector &a, const Change *first, const Change *last, const FlexVector &source);
+
 // Whether `v` is canonical and its shape agrees with its size. A standing check on the representation
 // invariant, meant for tests. Linear in the size of the vector.
 template<Shape S> bool Check(const Trie<S> &v);
@@ -147,6 +167,14 @@ template<Shape S> bool Check(const Trie<S> &v);
 // How many nodes the library holds, so a test can confirm vectors release what they take. Kept only by an
 // audit build (-DVECTOR_AUDIT). Empty elsewhere, meaning not counted rather than zero.
 std::optional<uint64_t> LiveNodes();
+
+// How many stretches each stage of a diff resolved, counted since the library was loaded.
+// Kept only by an audit build (-DVECTOR_AUDIT).
+// Empty elsewhere, meaning not counted rather than zero.
+struct Phases {
+    uint64_t Probed, Ran, Hashed, Searched, Whole;
+};
+std::optional<Phases> DiffPhases();
 
 // The bytes of node vectors still point at, against the bytes of slab those nodes are spread over: a walk
 // reads the first and covers the second, so a read pays the gap for the holes a build leaves.
@@ -221,7 +249,7 @@ template<Shape S> struct Transient {
     using const_iterator = iterator;
 
     Transient() = default;
-    template<Shape O> Transient(Transient<O> v)
+    template<Shape O> Transient(const Transient<O> &v)
         requires(S == Shape::Relaxed && O == Shape::Strict)
         : Data(v.Data) {}
 
@@ -239,9 +267,15 @@ template<Shape S> struct Transient {
     void set(uint64_t index, uint64_t value) { Data = Set(std::move(Data), index, value); }
     template<typename F> void update(uint64_t index, F &&fn) { Data = Update(std::move(Data), index, std::forward<F>(fn)); }
     void take(uint64_t count) { Data = Take(std::move(Data), count); }
-    void drop(uint64_t count) requires(S == Shape::Relaxed) { Data = Drop(std::move(Data), count); }
-    void append(const Transient &right) requires(S == Shape::Relaxed) { Data = Concat(Data, right.Data); }
-    void prepend(const Transient &left) requires(S == Shape::Relaxed) { Data = Concat(left.Data, Data); }
+    void drop(uint64_t count)
+        requires(S == Shape::Relaxed)
+    { Data = Drop(std::move(Data), count); }
+    void append(const Transient &right)
+        requires(S == Shape::Relaxed)
+    { Data = Concat(Data, right.Data); }
+    void prepend(const Transient &left)
+        requires(S == Shape::Relaxed)
+    { Data = Concat(left.Data, Data); }
 
     persistent_type persistent() & { return Data; }
     persistent_type persistent() && { return std::move(Data); }

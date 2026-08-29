@@ -6,6 +6,8 @@
 
 #include "Vector.h"
 
+#include "DiffCheck.h"
+
 #include <boost/ut.hpp>
 
 // immer is not included as a system header (see the top-level CMakeLists.txt), so silence its warnings.
@@ -15,6 +17,7 @@
 #include <immer/vector.hpp>
 #pragma clang diagnostic pop
 
+#include <algorithm>
 #include <random>
 #include <vector>
 
@@ -324,6 +327,70 @@ int main() {
             expect(total == n) << "chunks of" << n;
             expect(shaped) << "chunks of" << n;
         }
+    };
+
+    // Each case checks the answer and, in the audit build, the stage that produced it.
+    // The stages differ in cost by orders of magnitude, so a case moving from the first search to the full one is a regression the answer alone would hide.
+    "diff"_test = [] {
+        using diffcheck::Diffed, diffcheck::Diffs, diffcheck::OneChange, diffcheck::Rebuilds, diffcheck::Marked, diffcheck::Settled, diffcheck::Asked;
+        const vec::Vector empty;
+        expect(Diffed(empty, empty).empty());
+
+        // Stripping the common prefix and suffix is the whole answer for each of these.
+        auto mark = Marked();
+        for (const auto n : Sizes) {
+            const auto v = Pushed(Counting(n));
+            expect(Diffed(v, v).empty()) << "a vector against itself" << n;
+            expect(Diffs(empty, v) >> fatal) << "everything against nothing" << n;
+        }
+
+        // Each moves one run and must be reported as one run.
+        constexpr uint64_t N = 5'000;
+        const auto v = Pushed(Counting(N));
+        for (const uint64_t at : {uint64_t{0}, uint64_t{1}, uint64_t{63}, uint64_t{64}, uint64_t{2'500}, N - 1})
+            expect(OneChange(v, vec::Set(v, at, 9'999), at, 1, 1)) << "a write at" << at;
+        expect(OneChange(v, vec::PushBack(v, 1), N, 0, 1)) << "an append";
+        expect(OneChange(v, vec::Take(v, 3'000), 3'000, 2'000, 0)) << "a cut";
+        expect(Settled(mark, diffcheck::Stripped)) << "single runs, stages" << Asked(mark);
+
+        // Short vectors over a small alphabet, so matches repeat.
+        mark = Marked();
+        std::mt19937_64 rng{7};
+        for (uint64_t round = 0; round < 3'000; ++round) {
+            Values left(rng() % 13), right(rng() % 13);
+            for (auto &x : left) x = rng() % 4;
+            for (auto &x : right) x = rng() % 4;
+            expect(Diffs(Pushed(left), Pushed(right)) >> fatal) << "round" << round;
+        }
+        expect(Settled(mark, diffcheck::Probed)) << "short vectors, stages" << Asked(mark);
+
+        mark = Marked();
+        for (uint64_t edits = 1; edits <= 12; ++edits) {
+            auto b = v;
+            for (uint64_t i = 0; i < edits; ++i) b = vec::Set(std::move(b), rng() % b.Size, rng());
+            expect(Rebuilds(v, b) >> fatal) << "after" << edits << "writes";
+            expect((Diffed(v, b).size() <= edits) >> fatal) << "after" << edits << "writes";
+        }
+        expect(Settled(mark, diffcheck::Probed)) << "scattered writes, stages" << Asked(mark);
+
+        // Two unrelated vectors, more than `MaxEdits` edits apart, reported as one run.
+        mark = Marked();
+        Values other(N);
+        for (uint64_t i = 0; i < N; ++i) other[i] = rng();
+        expect(Rebuilds(v, Pushed(other))) << "unrelated vectors";
+        expect(Settled(mark, diffcheck::Whole)) << "unrelated vectors, stages" << Asked(mark);
+
+        // A block moved between two vectors built apart, so no node is shared and the block is found by content.
+        // The shorter of the block and the thousand elements it moved past must be the one reported moved.
+        mark = Marked();
+        for (const uint64_t block : {uint64_t{200}, uint64_t{700}, uint64_t{1'500}}) {
+            auto moved = Counting(N);
+            std::rotate(moved.begin() + 1'000, moved.begin() + 1'000 + block, moved.begin() + 2'000 + block);
+            const auto b = Pushed(moved);
+            expect(Rebuilds(v, b) >> fatal) << "a block of" << block << "moved between vectors built apart";
+            expect(diffcheck::Edits(Diffed(v, b)) == 2 * std::min<uint64_t>(block, 1'000)) << "a block of" << block << "moved between vectors built apart";
+        }
+        expect(Settled(mark, diffcheck::Hashed)) << "a block moved between vectors built apart, stages" << Asked(mark);
     };
 
     "reclamation"_test = [] {

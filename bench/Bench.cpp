@@ -98,20 +98,20 @@ void Run(uint64_t n, Pattern pattern) {
         Time(n, [&] { return hamt::Map{entries.begin(), entries.end()}.Size; }),
         Time(n, [&] { return ImmerMap{pairs.begin(), pairs.end()}.size(); }));
     Row("lookup hit",
-        Time(n, [&] { uint64_t s = 0; for (auto key : keys) s += *hamt::Get(ours, key); return s; }),
-        Time(n, [&] { uint64_t s = 0; for (auto key : keys) s += *theirs.find(key); return s; }));
+        Time(n, [&] { uint64_t s = 0; for (const auto key : keys) s += *hamt::Get(ours, key); return s; }),
+        Time(n, [&] { uint64_t s = 0; for (const auto key : keys) s += *theirs.find(key); return s; }));
     Row("lookup miss",
-        Time(n, [&] { uint64_t s = 0; for (auto key : absent) s += hamt::Get(ours, key) != nullptr; return s; }),
-        Time(n, [&] { uint64_t s = 0; for (auto key : absent) s += theirs.find(key) != nullptr; return s; }));
+        Time(n, [&] { uint64_t s = 0; for (const auto key : absent) s += hamt::Get(ours, key) != nullptr; return s; }),
+        Time(n, [&] { uint64_t s = 0; for (const auto key : absent) s += theirs.find(key) != nullptr; return s; }));
     // Both sides move, so a write can rewrite a path in place: ours because `Erase` and
     // `Update` take the map by value, immer through its default policy's rvalue overloads. On an lvalue
     // both copy every path -- 2.7x on erase and 2.9x on update, swamping what these rows report.
     Row("erase move",
-        Time(n, [&] { auto m = ours; for (auto key : keys) m = hamt::Erase(std::move(m), key); return m.Size; }),
-        Time(n, [&] { auto m = theirs; for (auto key : keys) m = std::move(m).erase(key); return m.size(); }));
+        Time(n, [&] { auto m = ours; for (const auto key : keys) m = hamt::Erase(std::move(m), key); return m.Size; }),
+        Time(n, [&] { auto m = theirs; for (const auto key : keys) m = std::move(m).erase(key); return m.size(); }));
     Row("update move",
-        Time(n, [&] { auto m = ours; for (auto key : keys) m = hamt::Update(std::move(m), key, [](uint64_t v) { return v + 1; }); return m.Size; }),
-        Time(n, [&] { auto m = theirs; for (auto key : keys) m = std::move(m).update(key, [](uint64_t v) { return v + 1; }); return m.size(); }));
+        Time(n, [&] { auto m = ours; for (const auto key : keys) m = hamt::Update(std::move(m), key, [](uint64_t v) { return v + 1; }); return m.Size; }),
+        Time(n, [&] { auto m = theirs; for (const auto key : keys) m = std::move(m).update(key, [](uint64_t v) { return v + 1; }); return m.size(); }));
     // Both libraries walk a map two ways, worth separating. An iterator has to hold its position
     // between steps where a callback keeps it in the call stack, worth up to 28% on immer at a million
     // keys -- so an iterator row alone would compare our best walk against their second-best.
@@ -152,7 +152,7 @@ void Run(uint64_t n, Pattern pattern) {
 }
 } // namespace
 
-int main(int argc, char **argv) {
+int main(int argc, char *const *argv) {
     bench::Begin();
     // An optional leading key pattern, then sizes.
     //   HamtBench                     the three default sizes on random keys

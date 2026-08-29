@@ -2,9 +2,14 @@
 
 #include "Node.h"
 
+#include <algorithm>
+#include <bit>
 #include <cassert>
 #include <cstring>
+#include <memory>
+#include <numeric>
 #include <utility>
+#include <vector>
 
 namespace vec {
 static_assert(Iterator::MaxDepth >= (64 + Bits - 1) / Bits, "The iterator stack has to hold a whole path");
@@ -525,6 +530,642 @@ bool SameNodes(const Node *a, const Node *b, uint32_t shift) {
     return true;
 }
 
+// A position in a vector: the chunk holding the element and the path down to it.
+struct Cursor {
+    const Node *Nodes[Iterator::MaxDepth + 1]; // `Nodes[Depth]` is the chunk, and above it lies the path.
+    uint32_t Slots[Iterator::MaxDepth]; // `Slots[d]` is the child of `Nodes[d]` the path takes.
+    const uint64_t *Values; // The chunk's elements, and the index of the first of them.
+    uint64_t Base;
+    uint32_t Count, Depth;
+};
+
+// The cursor at `index`, which must be in range.
+template<Shape S> Cursor SeekTo(const Trie<S> &v, uint64_t index) {
+    Cursor c;
+    const auto told = TailOffset(v);
+    if (index >= told) {
+        c.Depth = 0;
+        c.Nodes[0] = v.Tail;
+        c.Base = told;
+    } else {
+        uint64_t within = index;
+        const auto *n = v.Root;
+        c.Depth = 0;
+        for (auto shift = v.Shift; shift; shift -= Bits) {
+            const auto slot = Slot<S>(n, within, shift);
+            c.Nodes[c.Depth] = n;
+            c.Slots[c.Depth] = slot;
+            n = Children(n)[slot];
+            ++c.Depth;
+        }
+        c.Nodes[c.Depth] = n;
+        c.Base = index - within;
+    }
+    c.Values = Values(c.Nodes[c.Depth]);
+    c.Count = c.Nodes[c.Depth]->Count;
+    return c;
+}
+
+// Moves the cursor to the next chunk, or returns false at the end.
+template<Shape S> bool Advance(const Trie<S> &v, Cursor &c) {
+    const auto at = c.Base + c.Count;
+    if (at >= v.Size) return false;
+    if (at >= TailOffset(v)) { // Into the tail, which is on no path.
+        c = SeekTo(v, at);
+        return true;
+    }
+    uint32_t d = c.Depth;
+    while (d && c.Slots[d - 1] + 1 >= c.Nodes[d - 1]->Count) --d;
+    ++c.Slots[d - 1];
+    const auto *n = Children(c.Nodes[d - 1])[c.Slots[d - 1]];
+    for (; d < c.Depth; ++d) {
+        c.Nodes[d] = n;
+        c.Slots[d] = 0;
+        n = Children(n)[0];
+    }
+    c.Nodes[c.Depth] = n;
+    c.Base = at;
+    c.Values = Values(n);
+    c.Count = n->Count;
+    return true;
+}
+
+// How many elements sit under `n`'s children before the one at `i`.
+uint64_t SlotOffset(const Node *n, uint32_t i, uint32_t shift) {
+    if (const auto *sizes = n->Sizes) return i ? Values(sizes)[i - 1] : 0;
+    return uint64_t(i) << shift;
+}
+
+// How far a match reaches around one position: `Before` elements before it and `After` from it on.
+struct Run {
+    uint64_t Before, After;
+};
+
+// How far the two cursors are on the same nodes, before and from their positions.
+// Zero on different chunks, which says nothing about the elements.
+// `Ahead` picks which side the siblings are read on.
+template<bool Ahead> Run Shared(const Cursor &a, uint64_t ia, const Cursor &b, uint64_t ib) {
+    const auto within = ia - a.Base;
+    if (a.Nodes[a.Depth] != b.Nodes[b.Depth] || within != ib - b.Base) return {0, 0};
+    Run run{within, a.Count - within};
+    uint32_t da = a.Depth, db = b.Depth, shift = 0;
+    while (da && db) {
+        const auto *pa = a.Nodes[da - 1], *pb = b.Nodes[db - 1];
+        if (pa != pb || a.Slots[da - 1] != b.Slots[db - 1]) break;
+        --da;
+        --db;
+        shift += Bits;
+        run.Before += SlotOffset(pa, a.Slots[da], shift);
+        run.After = SubtreeSize(pa, shift) - run.Before;
+    }
+    // A write copies only its path and leaves every sibling shared, so the run continues through the siblings that are the same node.
+    // One pointer compare per sibling, instead of a fresh descent per subtrie.
+    while (da && db) {
+        const auto *pa = a.Nodes[da - 1], *pb = b.Nodes[db - 1];
+        const auto pshift = shift + Bits;
+        const auto *const *ca = Children(pa);
+        const auto *const *cb = Children(pb);
+        uint32_t sa = a.Slots[da - 1], sb = b.Slots[db - 1];
+        if constexpr (Ahead) {
+            while (sa + 1 < pa->Count && sb + 1 < pb->Count && ca[sa + 1] == cb[sb + 1]) {
+                ++sa;
+                ++sb;
+                run.After += ChildSize(pa, sa, pshift);
+            }
+            if (sa + 1 < pa->Count || sb + 1 < pb->Count) break;
+        } else {
+            while (sa && sb && ca[sa - 1] == cb[sb - 1]) {
+                --sa;
+                --sb;
+                run.Before += ChildSize(pa, sa, pshift);
+            }
+            if (sa || sb) break;
+        }
+        --da;
+        --db;
+        shift = pshift;
+    }
+    return run;
+}
+
+// How many elements `a` from `ia` and `b` from `ib` agree on, up to `limit`.
+template<Shape S> uint64_t Extend(const Trie<S> &a, uint64_t ia, const Trie<S> &b, uint64_t ib, uint64_t limit) {
+    if (!limit) return 0;
+    auto ca = SeekTo(a, ia), cb = SeekTo(b, ib);
+    uint64_t n = 0;
+    while (true) {
+        if (const auto shared = Shared<true>(ca, ia + n, cb, ib + n).After) {
+            n += std::min(shared, limit - n); // A whole subtrie was skipped, so both cursors are sought again.
+            if (n >= limit) break;
+            ca = SeekTo(a, ia + n);
+            cb = SeekTo(b, ib + n);
+            continue;
+        }
+        const auto oa = uint32_t(ia + n - ca.Base), ob = uint32_t(ib + n - cb.Base);
+        const auto run = std::min({uint64_t{ca.Count - oa}, uint64_t{cb.Count - ob}, limit - n});
+        uint64_t k = 0;
+        while (k < run && ca.Values[oa + k] == cb.Values[ob + k]) ++k;
+        n += k;
+        if (k < run || n >= limit) break;
+        if (ia + n == ca.Base + ca.Count) Advance(a, ca);
+        if (ib + n == cb.Base + cb.Count) Advance(b, cb);
+    }
+    return n;
+}
+
+// The same backwards: how many elements `a` before `ia` and `b` before `ib` agree on, up to `limit`.
+template<Shape S> uint64_t ExtendBack(const Trie<S> &a, uint64_t ia, const Trie<S> &b, uint64_t ib, uint64_t limit) {
+    uint64_t n = 0;
+    while (n < limit) {
+        const auto ca = SeekTo(a, ia - n - 1), cb = SeekTo(b, ib - n - 1);
+        // A shared element and everything before it in the run agree.
+        if (const auto shared = Shared<false>(ca, ia - n - 1, cb, ib - n - 1); shared.After) {
+            n += std::min(shared.Before + 1, limit - n);
+            continue;
+        }
+        const auto oa = uint32_t(ia - n - 1 - ca.Base), ob = uint32_t(ib - n - 1 - cb.Base);
+        const auto run = std::min(uint64_t{std::min(oa, ob)} + 1, limit - n);
+        uint64_t k = 0;
+        while (k < run && ca.Values[oa - k] == cb.Values[ob - k]) ++k;
+        n += k;
+        if (k < run) break;
+    }
+    return n;
+}
+
+// The budget of the full search, which finds a script of up to twice this many edits.
+// The search costs the square of the budget, all of it when it fails.
+// Four chunks' worth finds every gap left by rewriting a twentieth of a million positions.
+// Doubling it found nothing more at any density measured, and halving it leaves some of those gaps reported as one run.
+constexpr int64_t MaxEdits = 4 * Slots;
+// The budget of the first search.
+// Nearly every stretch is resolved here, and one that is not differs by more than twice this, as a moved block does.
+constexpr int64_t Probe = 32;
+// The two frontiers of the search, one entry per diagonal, indexed from `-MaxEdits` to `MaxEdits`.
+// File scope rather than the stack, at 4KB apiece.
+int64_t Frontiers[2][2 * MaxEdits + 3];
+
+// The value of a diagonal no path has reached yet, low enough that a step from it is never on the grid.
+constexpr int64_t Unreached = INT64_MIN / 2;
+
+// A point a shortest script through `n` elements against `m` passes, or false when its cost exceeds `budget`.
+// `extend(ahead, x, y, limit)` reads the elements: how many agree from `x` and `y` on, or before the `x`th and `y`th from the end.
+template<typename Extender> bool Middle(int64_t n, int64_t m, int64_t budget, Extender &&extend, int64_t &sx, int64_t &sy) {
+    const int64_t delta = n - m;
+    auto *fwd = Frontiers[0] + MaxEdits + 1;
+    auto *bwd = Frontiers[1] + MaxEdits + 1;
+    // A split at either corner leaves one half equal to the whole, so only a split inside the grid is taken, which keeps the recursion finite.
+    const auto split = [&](int64_t x, int64_t y) {
+        if ((!x && !y) || (x == n && y == m)) return false;
+        sx = x;
+        sy = y;
+        return true;
+    };
+    // One step from the previous cost's frontier to the furthest point still on the grid.
+    // `left` is the diagonal below as it was before this cost overwrote it, and `right` the diagonal above, which this cost has not reached yet.
+    const auto step = [n, m](int64_t left, int64_t here, int64_t right, int64_t k) {
+        const auto on = [k, n, m](int64_t x) { return x >= 0 && x <= n && x - k >= 0 && x - k <= m; };
+        auto x = here;
+        for (const auto to : {left + 1, here + 1, right})
+            if (to > x && on(to)) x = to;
+        return x;
+    };
+    // Advances one frontier by one cost and checks it against `other` for a meeting, which is where the two together span `n`.
+    // `ahead` is which end `self` grows from, and `slack` is how many costs `other` is behind.
+    // The forward sweep meets the backward frontier of the previous cost, and the backward sweep meets the forward frontier of the same cost.
+    const auto sweep = [&](bool ahead, int64_t d, int64_t *self, const int64_t *other, int64_t slack) -> std::optional<bool> {
+        // The diagonals this cost reaches for the first time, cleared of an earlier search's values.
+        self[-d] = self[d] = self[d + 1] = Unreached;
+        for (int64_t k = -d, left = Unreached; k <= d; ++k) {
+            const auto here = self[k];
+            auto x = step(left, here, self[k + 1], k);
+            left = here;
+            if (x == Unreached) continue;
+            const auto y = x - k;
+            if (x < n && y < m) {
+                const auto limit = std::min(uint64_t(n - x), uint64_t(m - y));
+                x += int64_t(extend(ahead, uint64_t(x), uint64_t(y), limit));
+            }
+            self[k] = x;
+            if (const int64_t c = delta - k; c >= slack - d && c <= d - slack && x + other[c] >= n) return ahead ? split(x, x - k) : split(n - x, m - (x - k));
+        }
+        return {};
+    };
+    // Both frontiers start at the corners, where the stretches differ, so neither extends.
+    fwd[0] = bwd[0] = 0;
+    // A script costs at most the longer stretch, and the frontiers meet at half the cost.
+    const int64_t furthest = int64_t(std::min(uint64_t(std::max(n, m)) + 1, uint64_t(budget) * 2) / 2);
+    // Ukkonen's diagonal transitions from both ends, checked for a meeting after both steps at each cost.
+    // Myers checks after one step, since under his metric a script's cost has the parity of `n - m`, and an overwrite has no parity.
+    for (int64_t d = 1; d <= furthest; ++d) {
+        if (const auto crossed = sweep(true, d, fwd, bwd, 1)) return *crossed;
+        if (const auto crossed = sweep(false, d, bwd, fwd, 0)) return *crossed;
+    }
+    return false;
+}
+
+// No position: a key the table lacks, the end of a chain, or a key struck out for repeating.
+constexpr uint64_t None = ~uint64_t{0}, Repeated = None;
+
+// The position of each key in a stretch, open addressed.
+// `At` holds the position plus one, so zero is a free slot, or `Repeated`.
+// A key at two positions is struck out, since it says nothing about where a block went.
+struct Table {
+    struct Slot {
+        uint64_t Key, At;
+    };
+
+    uint64_t Mask, Held = 0;
+    std::vector<Slot> Slots;
+
+    // Room for `want` keys at half occupancy at most, since a lookup walks to a free slot.
+    explicit Table(uint64_t want) : Mask(std::bit_ceil(2 * want) - 1), Slots(Mask + 1) {}
+
+    Slot *Find(uint64_t key) {
+        auto *slot = Slots.data() + ((key ^ (key >> 29)) & Mask);
+        for (; slot->At && slot->Key != key; slot = Slots.data() + ((uint64_t(slot - Slots.data()) + 1) & Mask));
+        return slot;
+    }
+    // Keys past the room are dropped, which can only lose a run.
+    void Keep(uint64_t key, uint64_t at) {
+        auto *slot = Find(key);
+        if (slot->At) slot->At = Repeated;
+        else if (Held < (Mask + 1) / 2) {
+            *slot = {key, at + 1};
+            ++Held;
+        }
+    }
+    uint64_t At(uint64_t key) {
+        const auto *slot = Find(key);
+        return slot->At && slot->At != Repeated ? slot->At - 1 : None;
+    }
+};
+
+// Nodes are aligned to sixteen bytes, so the low four bits are dropped.
+uint64_t ChunkKey(const Node *n) { return reinterpret_cast<uintptr_t>(n) >> 4; }
+
+// One run common to both stretches: `Len` elements from `X` in `a` and from `Y` in `b`.
+struct Anchor {
+    uint64_t X, Y, Len;
+};
+
+// Per run in `Chain`: the weight of the best chain ending at it, and the run before it.
+struct Link {
+    uint64_t Best, Prev;
+};
+
+// Extends a match at `ia` and `ib` both ways into a run, and keeps the run if it is at least a chunk long.
+// Returns how far the run reaches from `ib` on, kept or not, so the caller can step past it.
+// `taken` moves to the end of a kept run, which keeps the runs disjoint in `b`.
+template<Shape S> uint64_t Grow(const Trie<S> &a, uint64_t x0, uint64_t x1, const Trie<S> &b, uint64_t y1, uint64_t ia, uint64_t ib, uint64_t &taken, std::vector<Anchor> &found) {
+    const auto before = ExtendBack(a, ia, b, ib, std::min(ia - x0, ib - taken));
+    const auto after = Extend(a, ia, b, ib, std::min(x1 - ia, y1 - ib));
+    if (before + after >= Slots) {
+        found.push_back({ia - before, ib - before, before + after});
+        taken = ib + after;
+    }
+    return after;
+}
+
+// The runs common to both stretches found by identity, in the order they sit in `b`, disjoint there.
+template<Shape S> void Runs(const Trie<S> &a, uint64_t x0, uint64_t x1, const Trie<S> &b, uint64_t y0, uint64_t y1, std::vector<Anchor> &found) {
+    // Sized from the length rather than a count of chunks, so the table size does not depend on how the stretch is cut.
+    Table table((x1 - x0) / Slots + 2);
+
+    // A chunk straddling either end is left out, so every run stays inside the stretch.
+    for (auto c = SeekTo(a, x0);;) {
+        if (c.Base >= x0) table.Keep(ChunkKey(c.Nodes[c.Depth]), c.Base);
+        if (c.Base + c.Count >= x1 || !Advance(a, c)) break;
+    }
+
+    uint64_t taken = y0; // How far into `b` the runs reach, where the next one is measured from.
+    for (auto c = SeekTo(b, y0);;) {
+        // Skips a found run, so a block's chunks are measured once.
+        auto next = c.Base + c.Count;
+        if (const auto ia = c.Base >= y0 ? table.At(ChunkKey(c.Nodes[c.Depth])) : None; ia != None)
+            next = std::max(next, c.Base + Grow(a, x0, x1, b, y1, ia, c.Base, taken, found));
+        if (next >= y1) break;
+        if (next == c.Base + c.Count) {
+            if (!Advance(b, c)) break;
+        } else {
+            c = SeekTo(b, next);
+        }
+    }
+}
+
+template<Shape S> void Copy(const Trie<S> &v, uint64_t from, uint64_t to, uint64_t *out) {
+    for (auto c = SeekTo(v, from); from < to; Advance(v, c)) {
+        const auto offset = from - c.Base, count = std::min(uint64_t{c.Count} - offset, to - from);
+        std::memcpy(out, c.Values + offset, count * sizeof(uint64_t));
+        out += count;
+        from += count;
+    }
+}
+
+template<Shape S> struct Reader {
+    const Trie<S> &Vec;
+    Cursor Cur;
+    uint64_t At;
+    Reader(const Trie<S> &v, uint64_t at) : Vec(v), Cur(SeekTo(v, at)), At(at) {}
+    uint64_t Next() {
+        if (At == Cur.Base + Cur.Count) Advance(Vec, Cur);
+        return Cur.Values[At++ - Cur.Base];
+    }
+};
+
+// A window is hashed as a polynomial in an odd base over the mixed values, so the hash rolls.
+// The mixing keeps structured values from cancelling through the base.
+constexpr uint64_t Window = Slots;
+constexpr uint64_t HashBase = 0x9E3779B97F4A7C15;
+constexpr uint64_t Highest = [] {
+    uint64_t p = 1;
+    for (uint64_t i = 1; i < Window; ++i) p *= HashBase;
+    return p;
+}();
+uint64_t Mixed(uint64_t v) { return (v ^ (v >> 31)) * 0xBF58476D1CE4E5B9; }
+
+// Adds the runs found by content to those found by identity, still disjoint in `b`.
+// Two runs may overlap in `a`, which `Chain` allows.
+template<Shape S> void Blocks(const Trie<S> &a, uint64_t x0, uint64_t x1, const Trie<S> &b, uint64_t y0, uint64_t y1, std::vector<Anchor> &found) {
+    if (x1 - x0 < Window || y1 - y0 < Window) return;
+    const auto count = found.size(); // The runs identity found, indexed rather than pointed to, since `push_back` may move them.
+
+    // Visits the stretches of `a` no run covers, in order.
+    // The runs may overlap in `a`, so they are sorted by start first.
+    std::vector<uint64_t> order(count);
+    std::iota(order.begin(), order.end(), 0);
+    std::sort(order.begin(), order.end(), [&found](uint64_t i, uint64_t j) { return found[i].X < found[j].X; });
+    const auto uncovered = [&](auto visit) {
+        uint64_t covered = x0;
+        for (uint64_t r = 0; r < count; ++r) {
+            const auto &run = found[order[r]];
+            if (run.X > covered) visit(covered, run.X);
+            covered = std::max(covered, run.X + run.Len);
+        }
+        if (x1 > covered) visit(covered, x1);
+    };
+    uint64_t windows = 0;
+    uncovered([&windows](uint64_t s, uint64_t e) { windows += (e - s) / Window; });
+    if (!windows) return;
+
+    // rsync's method: the windows of `a` at a fixed stride are hashed into a table, and a window is rolled over `b` one element at a time.
+    Table table(windows);
+    // A bit set in front of the table, so a position of `b` matching no window of `a` costs one load rather than a table probe.
+    // The bit set is a sixteenth of the table's size, at least one word, and stays in cache.
+    const uint64_t mark_mask = std::max<uint64_t>((table.Mask + 1) * 16, 64) - 1;
+    std::vector<uint64_t> seen((mark_mask + 1) / 64);
+    const auto mark = [mark_mask](uint64_t h) { return (h >> 20) & mark_mask; };
+    uncovered([&](uint64_t s, uint64_t e) {
+        Reader ra(a, s);
+        for (uint64_t p = s; p + Window <= e; p += Window) {
+            uint64_t h = 0;
+            for (uint64_t i = 0; i < Window; ++i) h = h * HashBase + Mixed(ra.Next());
+            table.Keep(h, p);
+            seen[mark(h) / 64] |= uint64_t{1} << (mark(h) % 64);
+        }
+    });
+
+    // The mixed values of the window at `q`, each at the slot of its position, so the value leaving shares the slot of the value arriving.
+    uint64_t ring[Window];
+    uint64_t r = 0; // The first run found by identity that the walk has not passed.
+    uint64_t taken = y0; // How far into `b` the runs reach, and where the window restarts after one.
+    for (uint64_t q = y0;;) {
+        while (r < count && found[r].Y + found[r].Len <= q) ++r;
+        // Where the uncovered stretch ends: at the next run found by identity, or at the end of the stretch.
+        // `q` itself when the walk is inside a run, which the branch below skips.
+        const auto end = r == count ? y1 : std::max(found[r].Y, q);
+        if (q + Window > end) { // Inside a run, or in a stretch too short for a window.
+            if (r == count) break;
+            taken = q = found[r].Y + found[r].Len;
+            ++r;
+            continue;
+        }
+        Reader rb(b, q);
+        uint64_t h = 0;
+        for (uint64_t i = 0; i < Window; ++i) h = h * HashBase + (ring[(q + i) & (Window - 1)] = Mixed(rb.Next()));
+        while (true) {
+            // A window that is a real match extends at least its own length, and a hash collision does not.
+            if (const auto ia = (seen[mark(h) / 64] >> (mark(h) % 64)) & 1 ? table.At(h) : None; ia != None) {
+                if (Grow(a, x0, x1, b, end, ia, q, taken, found) >= Window) {
+                    q = taken;
+                    break;
+                }
+            }
+            if (q + Window >= end) {
+                q = end;
+                break;
+            }
+            auto &leaving = ring[q & (Window - 1)];
+            const auto arriving = Mixed(rb.Next());
+            h = (h - leaving * Highest) * HashBase + arriving;
+            leaving = arriving;
+            ++q;
+        }
+        if (q == y1) break;
+    }
+}
+
+// Of `runs` in the order they sit in `b`, the chain covering the most elements: runs increasing in `a` as well, none overlapping the next.
+// Returns the indices of the chosen runs, first to last.
+std::vector<uint64_t> Chain(const std::vector<Anchor> &runs) {
+    // A longest increasing subsequence weighted by length, over a Fenwick tree of the runs' ends in `a`.
+    const auto count = runs.size();
+    std::vector<uint64_t> order(count);
+    std::iota(order.begin(), order.end(), 0);
+    std::sort(order.begin(), order.end(), [&runs](uint64_t i, uint64_t j) { return runs[i].X + runs[i].Len < runs[j].X + runs[j].Len; });
+    std::vector<Link> links(count);
+    std::vector<uint64_t> rank(count);
+    // Per prefix of the order, the best chain and the run it ends at.
+    std::vector<Link> tree(count + 1);
+    for (uint64_t r = 0; r < count; ++r) rank[order[r]] = r + 1;
+    uint64_t best = 0, last = None;
+    for (uint64_t j = 0; j < count; ++j) {
+        // The runs ending in `a` at or before this one starts form a prefix of the order.
+        uint64_t lo = 0, hi = count;
+        while (lo < hi) {
+            const auto mid = (lo + hi) / 2;
+            if (runs[order[mid]].X + runs[order[mid]].Len <= runs[j].X) lo = mid + 1;
+            else hi = mid;
+        }
+        Link at{0, None};
+        for (auto r = lo; r; r -= r & (~r + 1))
+            if (tree[r].Best > at.Best) at = tree[r];
+        links[j] = {runs[j].Len + at.Best, at.Prev};
+        for (auto r = rank[j]; r <= count; r += r & (~r + 1))
+            if (links[j].Best > tree[r].Best) tree[r] = {links[j].Best, j};
+        if (links[j].Best > best) {
+            best = links[j].Best;
+            last = j;
+        }
+    }
+    uint64_t chosen = 0;
+    for (auto j = last; j != None; j = links[j].Prev) ++chosen;
+    for (auto j = last, at = chosen; j != None; j = links[j].Prev) order[--at] = j;
+    order.resize(chosen);
+    return order;
+}
+
+// A split can leave two adjacent runs, so each run is held until the next arrives and merged with it if they touch.
+struct Sink {
+    void (*Report)(void *, const Change &);
+    void *Context;
+    Change Held{};
+    bool Holding{};
+
+    void operator()(uint64_t index, uint64_t removed, uint64_t to, uint64_t added) {
+        if (Holding && Held.Index + Held.Removed == index && Held.To + Held.Added == to) {
+            Held.Removed += removed;
+            Held.Added += added;
+            return;
+        }
+        Flush();
+        Held = {index, removed, to, added};
+        Holding = true;
+    }
+    void Flush() {
+        if (Holding) Report(Context, Held);
+        Holding = false;
+    }
+};
+
+// Which stage of `DiffRange` resolved a stretch.
+enum : uint32_t { ByProbe,
+                  ByRun,
+                  ByBlock,
+                  BySearch,
+                  ByNothing };
+#ifdef VECTOR_AUDIT
+uint64_t Settled[5];
+void Tally(uint32_t which) { ++Settled[which]; }
+#else
+void Tally(uint32_t) {}
+#endif
+
+template<Shape S> void DiffRange(const Trie<S> &a, uint64_t x0, uint64_t x1, const Trie<S> &b, uint64_t y0, uint64_t y1, Sink &sink);
+
+uint64_t Agree(const uint64_t *a, const uint64_t *b, uint64_t limit) {
+    uint64_t k = 0;
+    while (k < limit && a[k] == b[k]) ++k;
+    return k;
+}
+uint64_t AgreeBack(const uint64_t *a, const uint64_t *b, uint64_t limit) {
+    uint64_t k = 0;
+    while (k < limit && a[-1 - int64_t(k)] == b[-1 - int64_t(k)]) ++k;
+    return k;
+}
+
+// The longest stretch, both sides together, copied to flat arrays before the first search.
+// A search step over the trie is two seeks and over a flat copy it is one compare.
+// The copy costs 3us at this length on a sparse stretch the trie resolves in a few steps.
+// At twice this, sixteen scattered writes in a hundred thousand elements cost seven times as much, since the stretch between two of them is copied.
+constexpr uint64_t FlatLimit = 8192;
+// The longest stretch copied before the full search.
+// A stretch reaching the full search differs at least every other chunk, so the search costs more than the copy up to this length.
+constexpr uint64_t SearchFlatLimit = 64 * FlatLimit;
+
+// Diffs `A[x0, x1)` against `B[y0, y1)`, flat copies of the vectors from `ox` and `oy` on.
+// Returns false without reporting anything when a shortest script costs more than `budget`.
+bool FlatRange(const uint64_t *A, int64_t x0, int64_t x1, const uint64_t *B, int64_t y0, int64_t y1, int64_t budget, uint64_t ox, uint64_t oy, Sink &sink) {
+    const auto pre = int64_t(Agree(A + x0, B + y0, uint64_t(std::min(x1 - x0, y1 - y0))));
+    x0 += pre;
+    y0 += pre;
+    const auto post = int64_t(AgreeBack(A + x1, B + y1, uint64_t(std::min(x1 - x0, y1 - y0))));
+    x1 -= post;
+    y1 -= post;
+    if (x0 == x1 && y0 == y1) return true;
+    const auto extend = [&](bool ahead, uint64_t x, uint64_t y, uint64_t limit) { return ahead ? Agree(A + x0 + x, B + y0 + y, limit) : AgreeBack(A + x1 - x, B + y1 - y, limit); };
+    int64_t sx, sy;
+    if (x0 != x1 && y0 != y1 && !(x1 - x0 == 1 && y1 - y0 == 1)) {
+        if (!Middle(x1 - x0, y1 - y0, budget, extend, sx, sy)) return false;
+        // Each half costs at most the whole, and at most its longer side, so a budget of the longer side never fails.
+        const auto whole = std::max(x1 - x0, y1 - y0);
+        FlatRange(A, x0, x0 + sx, B, y0, y0 + sy, whole, ox, oy, sink);
+        FlatRange(A, x0 + sx, x1, B, y0 + sy, y1, whole, ox, oy, sink);
+        return true;
+    }
+    sink(ox + uint64_t(x0), uint64_t(x1 - x0), oy + uint64_t(y0), uint64_t(y1 - y0));
+    return true;
+}
+
+// Aligns the stretch on the runs common to both and diffs each gap between them.
+// Returns false without reporting anything when there are none.
+template<Shape S> bool Anchored(const Trie<S> &a, uint64_t x0, uint64_t x1, const Trie<S> &b, uint64_t y0, uint64_t y1, Sink &sink) {
+    std::vector<Anchor> found;
+    Runs(a, x0, x1, b, y0, y1, found);
+    auto by = ByRun;
+    const auto known = found.size();
+    Blocks(a, x0, x1, b, y0, y1, found);
+    if (found.size() > known) {
+        // Both lists are ordered and disjoint in `b`, so the union is one merge.
+        std::inplace_merge(found.begin(), found.begin() + int64_t(known), found.end(), [](const Anchor &p, const Anchor &q) { return p.Y < q.Y; });
+        by = ByBlock;
+    }
+    if (found.empty()) return false;
+    // Chosen over every run at once, those found by identity and by content together.
+    // Splitting at one run, or chaining identity before content, can pick the larger side of a block moved past one nearly its own size.
+    const auto chosen = Chain(found);
+    Tally(by);
+    // Every gap is shorter than the stretch, since a run is at least a chunk long.
+    uint64_t x = x0, y = y0;
+    for (const auto i : chosen) {
+        const auto &run = found[i];
+        DiffRange(a, x, run.X, b, y, run.Y, sink);
+        x = run.X + run.Len;
+        y = run.Y + run.Len;
+    }
+    DiffRange(a, x, x1, b, y, y1, sink);
+    return true;
+}
+
+template<Shape S> void DiffRange(const Trie<S> &a, uint64_t x0, uint64_t x1, const Trie<S> &b, uint64_t y0, uint64_t y1, Sink &sink) {
+    // The common prefix and suffix, which are the whole answer for two vectors related by one write, append, cut, or splice.
+    const auto pre = Extend(a, x0, b, y0, std::min(x1 - x0, y1 - y0));
+    x0 += pre;
+    y0 += pre;
+    const auto post = ExtendBack(a, x1, b, y1, std::min(x1 - x0, y1 - y0));
+    x1 -= post;
+    y1 -= post;
+    if (x0 == x1 && y0 == y1) return;
+    // One element against one is an overwrite, and a script of one edit has no middle.
+    if (x1 - x0 == 1 && y1 - y0 == 1) {
+        sink(x0, 1, y0, 1);
+        return;
+    }
+    // One side empty is one run added or removed.
+    if (x0 != x1 && y0 != y1) {
+        // A stretch of up to `limit` elements is copied to flat arrays and searched there, one compare per step instead of two seeks.
+        // One buffer holds both sides end to end, uninitialized since the copy fills it, and is made once for both searches.
+        const auto n = x1 - x0, m = y1 - y0;
+        std::unique_ptr<uint64_t[]> copies;
+        const auto extend = [&](bool ahead, uint64_t x, uint64_t y, uint64_t limit) { return ahead ? Extend(a, x0 + x, b, y0 + y, limit) : ExtendBack(a, x1 - x, b, y1 - y, limit); };
+        const auto searched = [&](int64_t budget, uint64_t limit, uint32_t which) {
+            if (n + m <= limit) {
+                if (!copies) {
+                    copies.reset(new uint64_t[n + m]);
+                    Copy(a, x0, x1, copies.get());
+                    Copy(b, y0, y1, copies.get() + n);
+                }
+                if (!FlatRange(copies.get(), 0, int64_t(n), copies.get() + n, 0, int64_t(m), budget, x0, y0, sink)) return false;
+            } else {
+                int64_t sx, sy;
+                if (!Middle(int64_t(n), int64_t(m), budget, extend, sx, sy)) return false;
+                DiffRange(a, x0, x0 + uint64_t(sx), b, y0, y0 + uint64_t(sy), sink);
+                DiffRange(a, x0 + uint64_t(sx), x1, b, y0 + uint64_t(sy), y1, sink);
+            }
+            Tally(which);
+            return true;
+        };
+        // The search costs the square of the edit count, so three stages, cheapest first.
+        // A search with a small budget, then alignment on the runs common to both, which finds a moved block, then a search with the full budget.
+        // A stretch past all three is reported as one run, which bounds the work on two unrelated vectors.
+        if (searched(Probe, FlatLimit, ByProbe)) return;
+        if (Anchored(a, x0, x1, b, y0, y1, sink)) return;
+        if (searched(MaxEdits, SearchFlatLimit, BySearch)) return;
+        Tally(ByNothing);
+    }
+    sink(x0, x1 - x0, y0, y1 - y0);
+}
+
 // How many elements sit under `n`, or zero for a node that breaks the invariant -- which no well formed
 // node returns, every node standing over at least one element.
 template<Shape S> uint64_t CheckNode(const Node *n, uint32_t shift) {
@@ -638,7 +1279,7 @@ template<Shape S> void TakeMut(Trie<S> &v, uint64_t count) {
         if (v.Tail->Refs == 1) {
             Mutable(v.Tail)->Count = tc;
         } else {
-            auto *tail = CopiedLeaf(v.Tail, tc);
+            const auto *tail = CopiedLeaf(v.Tail, tc);
             Release(v.Tail, 0);
             v.Tail = tail;
         }
@@ -900,6 +1541,25 @@ template<Shape S> bool operator==(const Trie<S> &a, const Trie<S> &b) {
     }
 }
 
+template<Shape S> void Diff(const Trie<S> &a, const Trie<S> &b, void (*report)(void *, const Change &), void *context) {
+    Sink sink{report, context};
+    // An empty stretch is never read, so an empty vector's null tail is never sought.
+    DiffRange(a, 0, a.Size, b, 0, b.Size, sink);
+    sink.Flush();
+}
+
+FlexVector Apply(const FlexVector &a, const Change *first, const Change *last, const FlexVector &source) {
+    FlexVector out;
+    uint64_t at = 0; // How far into `a` the runs so far reach.
+    for (const auto *c = first; c != last; ++c) {
+        // Each piece is two cuts and a join, logarithmic, and shares every subtrie it does not straddle.
+        out = Concat(out, Take(Drop(a, at), c->Index - at));
+        out = Concat(out, Take(Drop(source, c->To), c->Added));
+        at = c->Index + c->Removed;
+    }
+    return Concat(out, Drop(a, at));
+}
+
 template<Shape S> bool Check(const Trie<S> &v) {
     if (!v.Size) return !v.Root && !v.Tail && v.Shift == 0;
     if (!v.Tail || !v.Tail->Count || v.Tail->Count > Slots) return false;
@@ -910,6 +1570,14 @@ template<Shape S> bool Check(const Trie<S> &v) {
     if (!v.Root || v.Shift % Bits || v.Shift >= 64) return false; // The root stands on a level boundary.
     if (v.Shift && v.Root->Count < 2) return false; // And no higher than it has to.
     return CheckNode<S>(v.Root, v.Shift) == told;
+}
+
+std::optional<Phases> DiffPhases() {
+#ifdef VECTOR_AUDIT
+    return Phases{Settled[ByProbe], Settled[ByRun], Settled[ByBlock], Settled[BySearch], Settled[ByNothing]};
+#else
+    return {};
+#endif
 }
 
 std::optional<uint64_t> LiveNodes() {
@@ -989,6 +1657,8 @@ template void ForEachChunk(const Vector &, void (*)(void *, const uint64_t *, co
 template void ForEachChunk(const FlexVector &, void (*)(void *, const uint64_t *, const uint64_t *), void *);
 template bool operator==(const Vector &, const Vector &);
 template bool operator==(const FlexVector &, const FlexVector &);
+template void Diff(const Vector &, const Vector &, void (*)(void *, const Change &), void *);
+template void Diff(const FlexVector &, const FlexVector &, void (*)(void *, const Change &), void *);
 template bool Check(const Vector &);
 template bool Check(const FlexVector &);
 template Iterator begin(const Vector &);

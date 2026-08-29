@@ -148,7 +148,7 @@ void Run(uint64_t n, Pattern pattern) {
 }
 } // namespace
 
-int main(int argc, char **argv) {
+int main(int argc, char *const *argv) {
     bench::Begin();
     // An optional leading key pattern, then sizes.
     //   SetBench                     the three default sizes on random keys

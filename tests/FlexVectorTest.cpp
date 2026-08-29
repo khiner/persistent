@@ -6,6 +6,8 @@
 
 #include "Vector.h"
 
+#include "DiffCheck.h"
+
 #include <boost/ut.hpp>
 
 // immer is not included as a system header (see the top-level CMakeLists.txt), so silence its warnings.
@@ -15,6 +17,7 @@
 #include <immer/flex_vector.hpp>
 #pragma clang diagnostic pop
 
+#include <algorithm>
 #include <random>
 #include <vector>
 
@@ -140,8 +143,8 @@ int main() {
 
         auto right = vec::FlexVector{50, 60}.transient();
         t.append(right);
-        auto left = vec::FlexVector{10}.transient();
-        t.prepend(std::move(left));
+        const auto left = vec::FlexVector{10}.transient();
+        t.prepend(left);
         expect(std::move(right).persistent() == vec::FlexVector{50, 60});
         const auto finished = std::move(t).persistent();
         expect(vec::Check(finished) >> fatal);
@@ -445,6 +448,161 @@ int main() {
         }
         expect(seen == N);
         for (uint64_t i = 0; i < N; ++i) expect(v[i] == 1'000'000 + i);
+    };
+
+    // Each case checks the answer and, in the audit build, the stage that produced it.
+    // The stages differ in cost by orders of magnitude, so a case moving from the first search to the full one is a regression the answer alone would hide.
+    "diff"_test = [] {
+        using diffcheck::Diffed, diffcheck::Diffs, diffcheck::OneChange, diffcheck::Rebuilds, diffcheck::Marked, diffcheck::Settled, diffcheck::Asked;
+        // `v` with the `n` elements at `from` taken out and put back in at `to`.
+        const auto Moved = [](const vec::FlexVector &v, uint64_t from, uint64_t n, uint64_t to) { return vec::Insert(vec::Erase(v, from, from + n), to, vec::Take(vec::Drop(v, from), n)); };
+        const vec::FlexVector empty;
+        expect(Diffed(empty, empty).empty());
+
+        // Stripping the common prefix and suffix is the whole answer for each of these.
+        auto mark = Marked();
+        for (const auto n : Sizes) {
+            const auto v = Ragged(n);
+            expect(Diffed(v, v).empty()) << "a vector against itself" << n;
+            expect(Diffs(empty, v) >> fatal) << "everything against nothing" << n;
+        }
+
+        // The writes the relaxed shape adds, each of which moves one run and must be reported as one run.
+        constexpr uint64_t N = 5'000;
+        const auto v = Ragged(N);
+        expect(OneChange(v, vec::Drop(v, 1'700), 0, 1'700, 0)) << "a cut from the front";
+        for (const uint64_t at : {uint64_t{0}, uint64_t{1}, uint64_t{64}, uint64_t{2'500}, N})
+            expect(OneChange(v, vec::Insert(v, at, 9'999), at, 0, 1)) << "one element put in at" << at;
+        for (const uint64_t at : {uint64_t{0}, uint64_t{1}, uint64_t{64}, uint64_t{2'500}, N - 1})
+            expect(OneChange(v, vec::Erase(v, at), at, 1, 0)) << "one element taken out at" << at;
+        // A join reports only the elements added, whichever nodes it rebuilt where the two vectors meet.
+        expect(OneChange(v, vec::Concat(v, Ragged(300, 11)), N, 0, 300)) << "a join on the end";
+        expect(OneChange(v, vec::Erase(v, 1'000, 3'000), 1'000, 2'000, 0)) << "a stretch taken out";
+        expect(Settled(mark, diffcheck::Stripped)) << "single runs, stages" << Asked(mark);
+
+        // Writes spaced evenly, up to the most the first search finds, and then more.
+        // Past that no chunk is unwritten, so there is no run to align on, and the full search resolves it.
+        for (const uint64_t writes : {uint64_t{16}, uint64_t{64}, uint64_t{256}}) {
+            mark = Marked();
+            auto b = v;
+            for (uint64_t i = 0; i < writes; ++i) b = vec::Set(std::move(b), i * (N / writes), ~i);
+            const auto changes = Diffed(v, b);
+            expect(Rebuilds(v, b) >> fatal) << writes << "writes spaced evenly";
+            expect(changes.size() == writes) << writes << "writes spaced evenly";
+            expect(diffcheck::Edits(changes) == writes) << writes << "writes spaced evenly";
+            expect(Settled(mark, writes > 64 ? diffcheck::Probed | diffcheck::Searched : diffcheck::Probed)) << writes << "writes spaced evenly, stages" << Asked(mark);
+        }
+
+        // A moved block, which the relaxed vector makes cheap.
+        // It differs by twice its own length, so past a few hundred elements the search fails and alignment on the shared run reports it.
+        mark = Marked();
+        for (const uint64_t block : {uint64_t{64}, uint64_t{512}, uint64_t{1'000}, uint64_t{2'000}}) {
+            const auto moved = Moved(v, 1'000, block, 3'000);
+            const auto changes = Diffed(v, moved);
+            expect(Rebuilds(v, moved) >> fatal) << "a block of" << block << "moved";
+            expect((changes.size() == 2u) >> fatal) << "a block of" << block << "moved";
+            expect(diffcheck::Edits(changes) == 2 * block) << "a block of" << block << "moved";
+        }
+
+        // A block moved past one nearly its own size, so the two shared runs are within a factor of two of each other.
+        // The shorter must be the one reported moved.
+        // Over a densely chunked base, so only the chunks at the ends of the moved block lose their nodes.
+        {
+            const auto values = Counting(20'000);
+            const vec::FlexVector dense = vec::Vector{values.begin(), values.end()};
+            for (const uint64_t block : {uint64_t{600}, uint64_t{900}, uint64_t{1'500}}) {
+                const auto moved = Moved(dense, 5'000, block, 6'000);
+                expect(Rebuilds(dense, moved) >> fatal) << "a block of" << block << "moved past a thousand";
+                expect(diffcheck::Edits(Diffed(dense, moved)) == 2 * std::min<uint64_t>(block, 1'000)) << "a block of" << block << "moved past a thousand";
+            }
+        }
+
+        // The same over the ragged base, where a splice merges the short chunks around the cut and the insertion point, so the moved block keeps no node.
+        for (const uint64_t block : {uint64_t{700}, uint64_t{900}, uint64_t{1'500}}) {
+            const auto moved = Moved(v, 1'000, block, 2'000);
+            expect(Rebuilds(v, moved) >> fatal) << "a block of" << block << "moved past a thousand, ragged";
+            expect(diffcheck::Edits(Diffed(v, moved)) == 2 * std::min<uint64_t>(block, 1'000)) << "a block of" << block << "moved past a thousand, ragged";
+        }
+        // Every moved block is found by a shared run, by identity or by content, and none reaches the full search.
+        expect(Settled(mark, diffcheck::Ran | diffcheck::Hashed)) << "moved blocks, stages" << Asked(mark);
+
+        // Short vectors over a small alphabet, built from pieces so the two share no nodes.
+        mark = Marked();
+        std::mt19937_64 rng{9};
+        for (uint64_t round = 0; round < 3'000; ++round) {
+            vec::FlexVector left, right;
+            for (uint64_t i = rng() % 13; i; --i) left = vec::PushBack(std::move(left), rng() % 4);
+            for (uint64_t i = rng() % 13; i; --i) right = vec::Insert(right, rng() % (right.Size + 1), rng() % 4);
+            expect(Diffs(left, right) >> fatal) << "round" << round;
+            expect(diffcheck::Obeys(left, right) >> fatal) << "round" << round;
+        }
+
+        // Longer vectors over a small alphabet, with more splices than the first search finds.
+        // The gaps between shared runs must be shortest scripts too.
+        for (uint64_t round = 0; round < 200; ++round) {
+            vec::FlexVector base;
+            for (uint64_t i = 0; i < 150; ++i) base = vec::PushBack(std::move(base), rng() % 5);
+            auto spliced = base;
+            for (uint64_t i = 0; i < 40; ++i) {
+                const auto at = rng() % spliced.Size;
+                spliced = rng() % 2 ? vec::Insert(spliced, at, rng() % 5) : vec::Erase(spliced, at);
+            }
+            expect(Diffs(base, spliced) >> fatal) << "round" << round;
+        }
+
+        // Scattered splices, each of which shifts every index after it.
+        for (uint64_t edits = 1; edits <= 8; ++edits) {
+            auto b = v;
+            for (uint64_t i = 0; i < edits; ++i) {
+                const auto at = rng() % b.Size;
+                b = rng() % 2 ? vec::Insert(b, at, rng()) : vec::Erase(b, at);
+            }
+            expect(Rebuilds(v, b) >> fatal) << "after" << edits << "splices";
+            expect((Diffed(v, b).size() <= edits) >> fatal) << "after" << edits << "splices";
+        }
+        expect(Settled(mark, diffcheck::Probed)) << "small alphabets and scattered splices, stages" << Asked(mark);
+
+        // Two unrelated vectors, more than `MaxEdits` edits apart, reported as one run.
+        mark = Marked();
+        vec::FlexVector other;
+        for (uint64_t i = 0; i < N; ++i) other = vec::PushBack(std::move(other), rng());
+        expect(Rebuilds(v, other)) << "unrelated vectors";
+        expect(Settled(mark, diffcheck::Whole)) << "unrelated vectors, stages" << Asked(mark);
+    };
+
+    "apply"_test = [] {
+        using diffcheck::Diffed, diffcheck::Obeys;
+        const auto patch = [](const vec::FlexVector &a, const std::vector<vec::Change> &changes, const vec::FlexVector &source) {
+            return vec::Apply(a, changes.data(), changes.data() + changes.size(), source);
+        };
+        const vec::FlexVector empty;
+        expect(patch(empty, {}, empty).Size == 0_u64);
+
+        // `Apply(a, Diff(a, b), b)` is `b`, over every write and every size in `Sizes`.
+        constexpr uint64_t N = 3'000;
+        const auto v = Ragged(N);
+        expect(Obeys(v, v)) << "a vector against itself";
+        expect(Obeys(empty, v) && Obeys(v, empty)) << "everything against nothing";
+        for (const auto n : Sizes) expect(Obeys(v, Ragged(n, 21)) >> fatal) << "against a vector of" << n;
+        expect(Obeys(v, vec::Insert(v, 1'500, 7)));
+        expect(Obeys(v, vec::Erase(v, 200, 900)));
+        expect(Obeys(v, vec::Drop(v, 1'100)));
+        expect(Obeys(v, vec::Concat(v, Ragged(400, 13))));
+        expect(Obeys(v, vec::Set(v, 2'000, 7)));
+
+        // A change holds no reference into the diff, so it can be applied after the diff.
+        const auto b = vec::Insert(vec::Set(v, 10, 5), 2'000, 9);
+        const auto changes = Diffed(v, b);
+        expect((changes.size() == 2u) >> fatal);
+        expect(patch(v, changes, b) == b) << "applied after the diff";
+
+        // A change holds indices and no elements, so the same changes can be applied to another vector.
+        const auto other = Ragged(N, 31);
+        const auto onto_other = patch(other, changes, b);
+        expect(onto_other.Size == b.Size) << "the same changes on another vector";
+        expect(vec::Check(onto_other) >> fatal);
+        expect(onto_other[10] == b[10] && onto_other[2'000] == b[2'000]) << "the added elements";
+        expect(onto_other[500] == other[500]) << "the rest unchanged";
     };
 
     "reclamation"_test = [] {

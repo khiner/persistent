@@ -463,7 +463,7 @@ template<typename E, typename S> void DiffLoneAgainst(const E &lone, const Node 
 // a slot the two disagree about is one of nine cases: each side holds an element, a child, or nothing.
 template<typename E, typename S> void DiffNodes(const Node *a, const Node *b, const S &sink) {
     if (a == b) return;
-    for (auto rest = Bitmap(a->Datamap | a->Nodemap | b->Datamap | b->Nodemap); rest; rest &= rest - 1) {
+    for (auto rest = a->Datamap | a->Nodemap | b->Datamap | b->Nodemap; rest; rest &= rest - 1) {
         const auto bit = Lowest(rest);
         if (a->Datamap & bit) {
             const auto &ea = Entries<E>(a)[DataOffset(*a, bit)];
