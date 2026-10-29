@@ -19,6 +19,10 @@ All except `Box` are benchmarked against immer.
   Supports logarithmic concatenation, removal from the front, and insertion and erasure in the middle.
   Conversion from `Vector` takes constant time.
   Reverse conversion is not supported.
+- `vec::Weighted` — a `FlexVector` with a weight on each slot.
+  Every inner node stores the running weight under each child, so `Weight`, `WeightBefore` (the weight before an index) and `Seek` (the first index whose running weight exceeds k) are single descents.
+  The weight is fixed at build time. `VECTOR_WEIGHT_KEY` is the slot value to count. The default, 10, counts newlines, which indexes text by line.
+  Conversion to `FlexVector` takes constant time.
 
 ## Vector diff
 
@@ -56,10 +60,10 @@ The four tries use `uint64_t` keys and values.
 `Box<T>` is header-only.
 
     cmake -B build && cmake --build build
-    ./build/tests/BoxTest && ./build/tests/HamtTest && ./build/tests/SetTest && ./build/tests/VectorTest && ./build/tests/FlexVectorTest
+    ./build/tests/BoxTest && ./build/tests/HamtTest && ./build/tests/SetTest && ./build/tests/VectorTest && ./build/tests/FlexVectorTest && ./build/tests/WeightedTest
     ./build/bench/HamtBench && ./build/bench/SetBench && ./build/bench/VectorBench && ./build/bench/FlexVectorBench
 
-`HamtAuditTest`, `SetAuditTest`, `VectorAuditTest`, and `FlexVectorAuditTest` run the same tests with node deallocation enabled so sanitizers can detect leaks.
+`HamtAuditTest`, `SetAuditTest`, `VectorAuditTest`, `FlexVectorAuditTest`, and `WeightedAuditTest` run the same tests with node deallocation enabled so sanitizers can detect leaks.
 `BoxTest` needs no separate audit build because boxes already deallocate their storage.
 
 [docs/Literature.md](docs/Literature.md) lists the papers and implementations this is based on.

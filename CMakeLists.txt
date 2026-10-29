@@ -39,11 +39,14 @@ target_compile_definitions(hamt_audit PRIVATE HAMT_AUDIT)
 # copies the tail, which is twice the bytes. Set this to 5 for a workload made of those two.
 set(VECTOR_BITS 6 CACHE STRING "Trie branching factor exponent: 5 for 32 slots per node, 6 for 64.")
 
+# The slot value `vec::Weighted` counts. The default, 10, counts newlines, which indexes text by line.
+set(VECTOR_WEIGHT_KEY 10 CACHE STRING "The slot value `vec::Weighted` counts.")
+
 # The same source twice, for the same reason as the map's: `vec_audit` drops the node free list.
 foreach(lib vec vec_audit)
     add_library(${lib} src/Vector.cpp)
     target_include_directories(${lib} PUBLIC src)
-    target_compile_definitions(${lib} PRIVATE VECTOR_BITS=${VECTOR_BITS})
+    target_compile_definitions(${lib} PRIVATE VECTOR_BITS=${VECTOR_BITS} PUBLIC VECTOR_WEIGHT_KEY=${VECTOR_WEIGHT_KEY})
 endforeach()
 target_compile_definitions(vec_audit PRIVATE VECTOR_AUDIT)
 

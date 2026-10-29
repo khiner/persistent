@@ -41,12 +41,14 @@ struct alignas(16) Node {
     // strict vector. Refcounted like any other node, so a write that moves no element hands its copy
     // the same table rather than another `Slots` words of it.
     const Node *Sizes;
+    // For a weighted inner node, a table whose value `i` is the total weight under children `0` through `i`. Null otherwise.
+    const Node *Weights;
     mutable uint32_t Refs;
     // How many of the slots are taken. Rounding the node up to its alignment leaves room for it, so
     // keeping it costs nothing over deriving it from where the node sits, and a copy reads it straight off.
     uint32_t Count;
 };
-static_assert(sizeof(Node) == Slots * sizeof(uint64_t) + 16, "The header has to sit in the padding the slots leave");
+static_assert(sizeof(Node) == Slots * sizeof(uint64_t) + 32, "The header has to sit in the padding the slots leave");
 
 inline const Node **Children(Node *n) { return n->Children; }
 inline const Node *const *Children(const Node *n) { return n->Children; }
@@ -128,6 +130,7 @@ inline Node *Alloc(uint32_t count) {
 inline Node *AllocInner(uint32_t count) {
     auto *n = Alloc(count);
     n->Sizes = nullptr;
+    n->Weights = nullptr;
     return n;
 }
 
@@ -137,7 +140,8 @@ inline void Release(const Node *n, uint32_t shift) {
     if (shift) {
         const auto *const *cs = Children(n);
         for (uint32_t i = 0, nc = n->Count; i < nc; ++i) Release(cs[i], shift - Bits);
-        if (n->Sizes) Release(n->Sizes, 0); // The table is a node, and goes the way its own does.
+        if (n->Sizes) Release(n->Sizes, 0); // A table is a node, and goes the way its own does.
+        if (n->Weights) Release(n->Weights, 0);
     }
 #ifdef VECTOR_AUDIT
     --Live;
@@ -175,16 +179,5 @@ inline Node *CopiedLeaf(const Node *n, uint32_t count) {
     auto *c = Alloc(count);
     std::memcpy(Values(c), Values(n), (count < n->Count ? count : n->Count) * sizeof(uint64_t));
     return c;
-}
-
-// The levels between `shift` and the leaves, as a chain holding `leaf` at the bottom. One child each,
-// since the chunk it carries is the first thing to reach that far.
-inline const Node *NewPath(uint32_t shift, const Node *leaf) {
-    for (; shift; shift -= Bits) {
-        auto *n = AllocInner(1);
-        Children(n)[0] = leaf;
-        leaf = n;
-    }
-    return leaf;
 }
 } // namespace vec

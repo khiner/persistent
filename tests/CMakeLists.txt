@@ -32,3 +32,10 @@ target_link_libraries(FlexVectorAuditTest PRIVATE vec_audit)
 # One build and not two: the box has no free list for an audit build to drop -- see src/Box.h.
 add_executable(BoxTest BoxTest.cpp)
 target_link_libraries(BoxTest PRIVATE box immer_reference Boost::ut)
+
+foreach(test WeightedTest WeightedAuditTest)
+    add_executable(${test} WeightedTest.cpp)
+    target_link_libraries(${test} PRIVATE Boost::ut)
+endforeach()
+target_link_libraries(WeightedTest PRIVATE vec)
+target_link_libraries(WeightedAuditTest PRIVATE vec_audit)

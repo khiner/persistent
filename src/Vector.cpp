@@ -16,14 +16,51 @@ static_assert(Iterator::MaxDepth >= (64 + Bits - 1) / Bits, "The iterator stack 
 
 namespace {
 constexpr bool Relaxed(Shape s) { return s == Shape::Relaxed; }
+template<typename W> constexpr bool HasWeight = !std::is_same_v<W, Unweighted>;
+
+template<typename W> uint64_t LeafWeight(const Node *n, uint64_t count) {
+    uint64_t weight = 0;
+    for (uint64_t i = 0; i < count; ++i) weight += W::Of(Values(n)[i]);
+    return weight;
+}
+template<typename W> uint64_t SubtreeWeight(const Node *n, uint32_t shift) {
+    if (shift) return Values(n->Weights)[n->Count - 1];
+    return LeafWeight<W>(n, n->Count);
+}
+
+template<typename W> void MeasureWeights(Node *c, uint32_t shift) {
+    if constexpr (HasWeight<W>) {
+        if (c->Weights) Release(c->Weights, 0);
+        auto *table = Alloc(c->Count);
+        uint64_t total = 0;
+        for (uint32_t i = 0, nc = c->Count; i < nc; ++i) Values(table)[i] = (total += SubtreeWeight<W>(Children(c)[i], shift - Bits));
+        c->Weights = table;
+    }
+}
+template<typename W> Node *Measured(Node *c, uint32_t shift) {
+    MeasureWeights<W>(c, shift);
+    return c;
+}
+
+// The levels between `shift` and the leaves, as a chain holding `leaf` at the bottom. One child each,
+// since the chunk it carries is the first thing to reach that far.
+template<typename W> const Node *NewPath(uint32_t shift, const Node *leaf) {
+    for (uint32_t level = Bits; level <= shift; level += Bits) {
+        auto *n = AllocInner(1);
+        Children(n)[0] = leaf;
+        MeasureWeights<W>(n, level);
+        leaf = n;
+    }
+    return leaf;
+}
 
 // A second reference to each node the trie stands on: what a copy and the widening both come to.
-template<Shape S> void Claim(const Trie<S> &v) {
+template<typename V> void Claim(const V &v) {
     if (v.Root) Retain(v.Root);
     if (v.Tail) Retain(v.Tail);
 }
 
-template<Shape S> void Swap(Trie<S> &a, Trie<S> &b) noexcept {
+template<typename V> void Swap(V &a, V &b) noexcept {
     std::swap(a.Root, b.Root);
     std::swap(a.Tail, b.Tail);
     std::swap(a.Size, b.Size);
@@ -32,8 +69,8 @@ template<Shape S> void Swap(Trie<S> &a, Trie<S> &b) noexcept {
 
 // Where the trie ends and the tail begins. A strict trie holds a whole number of chunks, so the size
 // with its low bits cleared says this without reaching for the tail.
-template<Shape S> uint64_t TailOffset(const Trie<S> &v) {
-    if constexpr (Relaxed(S)) return v.Size - v.Tail->Count;
+template<typename V> uint64_t TailOffset(const V &v) {
+    if constexpr (Relaxed(V::Kind)) return v.Size - v.Tail->Count;
     else return (v.Size - 1) & ~Mask;
 }
 
@@ -103,17 +140,18 @@ void SetSizes(Node *c, const uint64_t *each, uint32_t count, uint32_t shift) {
 }
 
 // The same where the caller cannot name the sizes, so every child is measured.
-void Measure(Node *c, uint32_t shift) {
+template<typename W> void Measure(Node *c, uint32_t shift) {
     uint64_t each[Slots];
     for (uint32_t i = 0, nc = c->Count; i < nc; ++i) each[i] = SubtreeSize(Children(c)[i], shift - Bits);
     SetSizes(c, each, c->Count, shift);
+    MeasureWeights<W>(c, shift);
 }
 
 // A fresh inner node standing for `n` with `count` children, the one at `idx` being `child`, which comes
 // in with the reference the new node keeps. Every other child is copied by reference, so each is
 // claimed. A `count` past what `n` holds appends. A write moves no element, so the copy carries the size
 // table it came with rather than working one out -- and an append never has one, being strict.
-template<Shape S> Node *WithChild(const Node *n, uint32_t count, uint32_t idx, const Node *child) {
+template<Shape S, typename W> Node *WithChild(const Node *n, uint32_t count, uint32_t idx, const Node *child, uint32_t shift) {
     auto *c = AllocInner(count);
     auto **cs = Children(c);
     const auto *const *src = Children(n);
@@ -128,13 +166,13 @@ template<Shape S> Node *WithChild(const Node *n, uint32_t count, uint32_t idx, c
             Retain(c->Sizes);
         }
     }
-    return c;
+    return Measured<W>(c, shift);
 }
 
 // A fresh node at `shift` holding `n`'s first `keep` children, with `last` in place of the final one --
 // or, when `last` is null, that child unchanged. `last` comes in with the reference the new node keeps,
 // and every other child is claimed.
-template<Shape S> Node *WithPrefix(const Node *n, uint32_t keep, const Node *last, uint32_t shift) {
+template<Shape S, typename W> Node *WithPrefix(const Node *n, uint32_t keep, const Node *last, uint32_t shift) {
     auto *c = AllocInner(keep);
     auto **cs = Children(c);
     const auto *const *src = Children(n);
@@ -147,24 +185,24 @@ template<Shape S> Node *WithPrefix(const Node *n, uint32_t keep, const Node *las
         Retain(cs[keep - 1]);
     }
     if constexpr (Relaxed(S)) {
-        if (!n->Sizes) return c; // Every child but the last was full, and cutting the last leaves that so.
+        if (!n->Sizes) return Measured<W>(c, shift); // Every child but the last was full, and cutting the last leaves that so.
         // Nothing before the cut moved, so the totals carry over and only the last entry is worked out.
         const auto *totals = Values(n->Sizes);
         const uint64_t span = uint64_t{1} << shift;
         uint32_t full = 0;
         while (full + 1 < keep && totals[full] == uint64_t(full + 1) * span) ++full;
-        if (full + 1 == keep) return c; // Short only past the cut, so the copy needs no table at all.
+        if (full + 1 == keep) return Measured<W>(c, shift); // Short only past the cut, so the copy needs no table at all.
         auto *sizes = Alloc(keep);
         std::memcpy(Values(sizes), totals, (keep - 1) * sizeof(uint64_t));
         Values(sizes)[keep - 1] = last ? (keep > 1 ? totals[keep - 2] : 0) + SubtreeSize(last, shift - Bits) : totals[keep - 1];
         c->Sizes = sizes;
     }
-    return c;
+    return Measured<W>(c, shift);
 }
 
 // The mirror: `n`'s children from `from` on, with `first` in place of the one at `from`, or that child
 // unchanged when `first` is null. Only the relaxed shape can lose its front, so only it comes here.
-Node *WithSuffix(const Node *n, uint32_t from, const Node *first, uint32_t shift) {
+template<typename W> Node *WithSuffix(const Node *n, uint32_t from, const Node *first, uint32_t shift) {
     const uint32_t keep = n->Count - from;
     auto *c = AllocInner(keep);
     auto **cs = Children(c);
@@ -187,21 +225,21 @@ Node *WithSuffix(const Node *n, uint32_t from, const Node *first, uint32_t shift
             ++full;
             while (full + 1 < keep && totals[from + full] - totals[from + full - 1] == span) ++full;
         }
-        if (full + 1 >= keep) return c; // Nothing short but the last child, so the copy is strict.
+        if (full + 1 >= keep) return Measured<W>(c, shift); // Nothing short but the last child, so the copy is strict.
         auto *sizes = Alloc(keep);
         auto *out = Values(sizes);
         const uint64_t dropped = totals[from] - head;
         out[0] = head;
         for (uint32_t i = 1; i < keep; ++i) out[i] = totals[from + i] - dropped;
         c->Sizes = sizes;
-        return c;
+        return Measured<W>(c, shift);
     }
     // Nothing but the first child can be short, `n` having been full to its own last.
     uint64_t each[Slots];
     each[0] = head;
     for (uint32_t i = 1; i < keep; ++i) each[i] = ChildSize(n, from + i, shift);
     SetSizes(c, each, keep, shift);
-    return c;
+    return Measured<W>(c, shift);
 }
 
 // Levels the trie no longer needs, dropped from the top: leaving a root over a single child would make
@@ -223,35 +261,35 @@ void Collapse(const Node *&root, uint32_t &shift) {
 // An append only ever touches the rightmost path, and a strict trie can say from `told` alone where that
 // path runs: the slot the chunk lands in either holds the one partly filled child or holds nothing yet,
 // and a level that is starting fresh is not descended at all.
-const Node *PushLeaf(const Node *n, const Node *leaf, uint64_t told, uint32_t shift, bool owned) {
+template<typename W> const Node *PushLeaf(const Node *n, const Node *leaf, uint64_t told, uint32_t shift, bool owned) {
     const auto idx = uint32_t((told >> shift) & Mask);
     // Nothing below this level is half filled exactly when the elements divide evenly by what a child
     // covers, and then the slot is one no chunk has reached.
     const bool fresh = (told & ((uint64_t{1} << shift) - 1)) == 0;
     const auto *old = fresh ? nullptr : Children(n)[idx];
-    const auto *child = fresh ? NewPath(shift - Bits, leaf) : PushLeaf(old, leaf, told, shift - Bits, owned && old->Refs == 1);
+    const auto *child = fresh ? NewPath<W>(shift - Bits, leaf) : PushLeaf<W>(old, leaf, told, shift - Bits, owned && old->Refs == 1);
     if (owned) {
-        if (child == old) return n;
+        if (child == old) return Measured<W>(Mutable(n), shift);
         if (old) Release(old, shift - Bits);
         Children(Mutable(n))[idx] = child;
         Mutable(n)->Count = idx + 1;
-        return n;
+        return Measured<W>(Mutable(n), shift);
     }
-    return WithChild<Shape::Strict>(n, idx + 1, idx, child);
+    return WithChild<Shape::Strict, W>(n, idx + 1, idx, child, shift);
 }
 
 // The same where nothing says where the rightmost path runs, so it is walked to the bottom and the chunk
 // placed on the way back up. Null when there is no room under `n` and the caller has to grow a level.
-const Node *PushLeaf(const Node *n, const Node *leaf, uint32_t shift, bool owned) {
+template<typename W> const Node *PushLeaf(const Node *n, const Node *leaf, uint32_t shift, bool owned) {
     const uint32_t last = n->Count - 1;
     const Node *grown = nullptr;
     if (shift > Bits) {
         const auto *below = Children(n)[last];
-        grown = PushLeaf(below, leaf, shift - Bits, owned && below->Refs == 1);
+        grown = PushLeaf<W>(below, leaf, shift - Bits, owned && below->Refs == 1);
     }
     if (!grown && n->Count == Slots) return nullptr; // Slot-full to the right all the way down.
     const uint32_t count = grown ? n->Count : n->Count + 1, idx = count - 1;
-    const auto *child = grown ? grown : NewPath(shift - Bits, leaf);
+    const auto *child = grown ? grown : NewPath<W>(shift - Bits, leaf);
 
     Node *c;
     if (owned) {
@@ -287,12 +325,12 @@ const Node *PushLeaf(const Node *n, const Node *leaf, uint32_t shift, bool owned
         each[idx] = leaf->Count;
         SetSizes(c, each, count, shift);
     }
-    return c;
+    return Measured<W>(c, shift);
 }
 
 // The trie with `leaf` on the end of it, where a filled tail goes. `told` is what the trie held before
 // it. `root` may be null, and both it and `leaf` come in with the reference the answer keeps.
-template<Shape S> void PushChunk(const Node *&root, uint32_t &shift, const Node *leaf, uint64_t told) {
+template<Shape S, typename W> void PushChunk(const Node *&root, uint32_t &shift, const Node *leaf, uint64_t told) {
     if (!root) { // The first full tail is the whole trie.
         root = leaf;
         shift = 0;
@@ -302,9 +340,9 @@ template<Shape S> void PushChunk(const Node *&root, uint32_t &shift, const Node 
     // Either way a root that is one lone chunk falls straight through to the level that goes on top.
     const Node *grown = nullptr;
     if constexpr (Relaxed(S)) {
-        if (shift) grown = PushLeaf(root, leaf, shift, root->Refs == 1);
+        if (shift) grown = PushLeaf<W>(root, leaf, shift, root->Refs == 1);
     } else {
-        if (told != Covers(shift)) grown = PushLeaf(root, leaf, told, shift, root->Refs == 1);
+        if (told != Covers(shift)) grown = PushLeaf<W>(root, leaf, told, shift, root->Refs == 1);
     }
     if (grown) {
         if (grown != root) {
@@ -316,18 +354,19 @@ template<Shape S> void PushChunk(const Node *&root, uint32_t &shift, const Node 
     // No room under the root, so a level goes on top of it.
     auto *top = AllocInner(2);
     Children(top)[0] = root;
-    Children(top)[1] = NewPath(shift, leaf);
+    Children(top)[1] = NewPath<W>(shift, leaf);
     if constexpr (Relaxed(S)) {
         const uint64_t each[]{SubtreeSize(root, shift), leaf->Count};
         SetSizes(top, each, 2, shift + Bits);
     }
+    MeasureWeights<W>(top, shift + Bits);
     root = top;
     shift += Bits;
 }
 
 // `value` says what to store given what the index holds now: the one thing `Set` and `Update` differ
 // in. A template and not a pointer, so `Set` compiles as it would have on its own.
-template<Shape S, typename F> const Node *SetAt(const Node *n, uint64_t index, F value, uint32_t shift, bool owned) {
+template<Shape S, typename W, typename F> const Node *SetAt(const Node *n, uint64_t index, F value, uint32_t shift, bool owned) {
     if (!shift) {
         const auto slot = uint32_t(index);
         if (!owned) {
@@ -341,18 +380,18 @@ template<Shape S, typename F> const Node *SetAt(const Node *n, uint64_t index, F
     }
     const auto idx = Slot<S>(n, index, shift);
     const auto *old = Children(n)[idx];
-    const auto *child = SetAt<S>(old, index, value, shift - Bits, owned && old->Refs == 1);
-    if (child == old) return n;
-    if (!owned) return WithChild<S>(n, n->Count, idx, child);
+    const auto *child = SetAt<S, W>(old, index, value, shift - Bits, owned && old->Refs == 1);
+    if (child == old) return Measured<W>(Mutable(n), shift); // Written in place. The weight may have changed.
+    if (!owned) return WithChild<S, W>(n, n->Count, idx, child, shift);
     Children(Mutable(n))[idx] = child;
     Release(old, shift - Bits);
-    return n;
+    return Measured<W>(Mutable(n), shift);
 }
 
 // The subtrie under `n` cut to its first `count` elements, null when nothing is left of it, with the
 // leaf that ends the cut handed back in `tail` rather than kept. Only the rightmost kept path is copied:
 // every subtrie left of it is kept whole and shared.
-template<Shape S> const Node *Cut(const Node *n, uint64_t count, uint32_t shift, const Node *&tail) {
+template<Shape S, typename W> const Node *Cut(const Node *n, uint64_t count, uint32_t shift, const Node *&tail) {
     if (!shift) {
         if (count == n->Count) {
             Retain(n);
@@ -364,14 +403,14 @@ template<Shape S> const Node *Cut(const Node *n, uint64_t count, uint32_t shift,
     }
     uint64_t within = count - 1;
     const auto idx = Slot<S>(n, within, shift);
-    const auto *child = Cut<S>(Children(n)[idx], within + 1, shift - Bits, tail);
+    const auto *child = Cut<S, W>(Children(n)[idx], within + 1, shift - Bits, tail);
     if (!child && !idx) return nullptr;
-    return WithPrefix<S>(n, child ? idx + 1 : idx, child, shift);
+    return WithPrefix<S, W>(n, child ? idx + 1 : idx, child, shift);
 }
 
 // The subtrie under `n` with its first `count` elements dropped, `count` being neither none of it nor
 // all of it. Only the leftmost kept path is copied.
-const Node *Dropped(const Node *n, uint64_t count, uint32_t shift) {
+template<typename W> const Node *Dropped(const Node *n, uint64_t count, uint32_t shift) {
     if (!shift) {
         auto *c = Alloc(n->Count - uint32_t(count));
         std::memcpy(Values(c), Values(n) + count, (n->Count - count) * sizeof(uint64_t));
@@ -379,8 +418,8 @@ const Node *Dropped(const Node *n, uint64_t count, uint32_t shift) {
     }
     uint64_t within = count;
     const auto idx = Slot<Shape::Relaxed>(n, within, shift);
-    const auto *child = within ? Dropped(Children(n)[idx], within, shift - Bits) : nullptr;
-    return WithSuffix(n, idx, child, shift);
+    const auto *child = within ? Dropped<W>(Children(n)[idx], within, shift - Bits) : nullptr;
+    return WithSuffix<W>(n, idx, child, shift);
 }
 
 // How many nodes a joined run may take beyond the fewest that would do. Bagwell and Rompf's `e`, and
@@ -391,7 +430,7 @@ constexpr uint32_t Extra = 2;
 // three standing at `shift`. Their children -- `left`'s bar its last, `center`'s, `right`'s bar its
 // first -- are one run at `shift - Bits`, and this hands back a node at `shift + Bits` holding that run
 // repacked into one or two children. `left` and `right` may be null, and all three are borrowed.
-const Node *Rebalance(const Node *left, const Node *center, const Node *right, uint32_t shift) {
+template<typename W> const Node *Rebalance(const Node *left, const Node *center, const Node *right, uint32_t shift) {
     const uint32_t below = shift - Bits;
     const Node *run[3 * Slots];
     uint32_t sizes[3 * Slots];
@@ -453,7 +492,7 @@ const Node *Rebalance(const Node *left, const Node *center, const Node *right, u
                 taken = 0;
             }
         }
-        if (below) Measure(c, below);
+        if (below) Measure<W>(c, below);
         packed[i] = c;
     }
 
@@ -464,25 +503,25 @@ const Node *Rebalance(const Node *left, const Node *center, const Node *right, u
         const uint32_t from = p * Slots, to = from + Slots < count ? from + Slots : count;
         auto *node = AllocInner(to - from);
         std::memcpy(static_cast<void *>(Children(node)), static_cast<const void *>(packed + from), (to - from) * sizeof(const Node *));
-        Measure(node, shift);
+        Measure<W>(node, shift);
         Children(top)[p] = node;
     }
-    Measure(top, shift + Bits);
+    Measure<W>(top, shift + Bits);
     return top;
 }
 
 // The join of two subtries, as a node standing one level above the taller of them and holding one or
 // two children at that level. Neither may be empty.
-const Node *Joined(const Node *left, uint32_t lshift, const Node *right, uint32_t rshift) {
+template<typename W> const Node *Joined(const Node *left, uint32_t lshift, const Node *right, uint32_t rshift) {
     if (lshift > rshift) {
-        const auto *center = Joined(Children(left)[left->Count - 1], lshift - Bits, right, rshift);
-        const auto *out = Rebalance(left, center, nullptr, lshift);
+        const auto *center = Joined<W>(Children(left)[left->Count - 1], lshift - Bits, right, rshift);
+        const auto *out = Rebalance<W>(left, center, nullptr, lshift);
         Release(center, lshift);
         return out;
     }
     if (lshift < rshift) {
-        const auto *center = Joined(left, lshift, Children(right)[0], rshift - Bits);
-        const auto *out = Rebalance(nullptr, center, right, rshift);
+        const auto *center = Joined<W>(left, lshift, Children(right)[0], rshift - Bits);
+        const auto *out = Rebalance<W>(nullptr, center, right, rshift);
         Release(center, rshift);
         return out;
     }
@@ -494,16 +533,16 @@ const Node *Joined(const Node *left, uint32_t lshift, const Node *right, uint32_
         Children(top)[1] = right;
         const uint64_t each[]{left->Count, right->Count};
         SetSizes(top, each, 2, Bits);
-        return top;
+        return Measured<W>(top, Bits);
     }
-    const auto *center = Joined(Children(left)[left->Count - 1], lshift - Bits, Children(right)[0], rshift - Bits);
-    const auto *out = Rebalance(left, center, right, lshift);
+    const auto *center = Joined<W>(Children(left)[left->Count - 1], lshift - Bits, Children(right)[0], rshift - Bits);
+    const auto *out = Rebalance<W>(left, center, right, lshift);
     Release(center, lshift);
     return out;
 }
 
 // Everything `v` holds as one trie, its tail folded in. Carries a reference.
-const Node *Flattened(const FlexVector &v, uint32_t &shift) {
+template<typename W> const Node *Flattened(const Flex<W> &v, uint32_t &shift) {
     if (!v.Root) {
         Retain(v.Tail);
         shift = 0;
@@ -513,7 +552,7 @@ const Node *Flattened(const FlexVector &v, uint32_t &shift) {
     Retain(root);
     Retain(v.Tail);
     shift = v.Shift;
-    PushChunk<Shape::Relaxed>(root, shift, v.Tail, TailOffset(v));
+    PushChunk<Shape::Relaxed, W>(root, shift, v.Tail, TailOffset(v));
     return root;
 }
 
@@ -540,7 +579,7 @@ struct Cursor {
 };
 
 // The cursor at `index`, which must be in range.
-template<Shape S> Cursor SeekTo(const Trie<S> &v, uint64_t index) {
+template<typename V> Cursor SeekTo(const V &v, uint64_t index) {
     Cursor c;
     const auto told = TailOffset(v);
     if (index >= told) {
@@ -552,7 +591,7 @@ template<Shape S> Cursor SeekTo(const Trie<S> &v, uint64_t index) {
         const auto *n = v.Root;
         c.Depth = 0;
         for (auto shift = v.Shift; shift; shift -= Bits) {
-            const auto slot = Slot<S>(n, within, shift);
+            const auto slot = Slot<V::Kind>(n, within, shift);
             c.Nodes[c.Depth] = n;
             c.Slots[c.Depth] = slot;
             n = Children(n)[slot];
@@ -567,7 +606,7 @@ template<Shape S> Cursor SeekTo(const Trie<S> &v, uint64_t index) {
 }
 
 // Moves the cursor to the next chunk, or returns false at the end.
-template<Shape S> bool Advance(const Trie<S> &v, Cursor &c) {
+template<typename V> bool Advance(const V &v, Cursor &c) {
     const auto at = c.Base + c.Count;
     if (at >= v.Size) return false;
     if (at >= TailOffset(v)) { // Into the tail, which is on no path.
@@ -649,7 +688,7 @@ template<bool Ahead> Run Shared(const Cursor &a, uint64_t ia, const Cursor &b, u
 }
 
 // How many elements `a` from `ia` and `b` from `ib` agree on, up to `limit`.
-template<Shape S> uint64_t Extend(const Trie<S> &a, uint64_t ia, const Trie<S> &b, uint64_t ib, uint64_t limit) {
+template<typename V> uint64_t Extend(const V &a, uint64_t ia, const V &b, uint64_t ib, uint64_t limit) {
     if (!limit) return 0;
     auto ca = SeekTo(a, ia), cb = SeekTo(b, ib);
     uint64_t n = 0;
@@ -674,7 +713,7 @@ template<Shape S> uint64_t Extend(const Trie<S> &a, uint64_t ia, const Trie<S> &
 }
 
 // The same backwards: how many elements `a` before `ia` and `b` before `ib` agree on, up to `limit`.
-template<Shape S> uint64_t ExtendBack(const Trie<S> &a, uint64_t ia, const Trie<S> &b, uint64_t ib, uint64_t limit) {
+template<typename V> uint64_t ExtendBack(const V &a, uint64_t ia, const V &b, uint64_t ib, uint64_t limit) {
     uint64_t n = 0;
     while (n < limit) {
         const auto ca = SeekTo(a, ia - n - 1), cb = SeekTo(b, ib - n - 1);
@@ -817,7 +856,7 @@ struct Link {
 // Extends a match at `ia` and `ib` both ways into a run, and keeps the run if it is at least a chunk long.
 // Returns how far the run reaches from `ib` on, kept or not, so the caller can step past it.
 // `taken` moves to the end of a kept run, which keeps the runs disjoint in `b`.
-template<Shape S> uint64_t Grow(const Trie<S> &a, uint64_t x0, uint64_t x1, const Trie<S> &b, uint64_t y1, uint64_t ia, uint64_t ib, uint64_t &taken, std::vector<Anchor> &found) {
+template<typename V> uint64_t Grow(const V &a, uint64_t x0, uint64_t x1, const V &b, uint64_t y1, uint64_t ia, uint64_t ib, uint64_t &taken, std::vector<Anchor> &found) {
     const auto before = ExtendBack(a, ia, b, ib, std::min(ia - x0, ib - taken));
     const auto after = Extend(a, ia, b, ib, std::min(x1 - ia, y1 - ib));
     if (before + after >= Slots) {
@@ -828,7 +867,7 @@ template<Shape S> uint64_t Grow(const Trie<S> &a, uint64_t x0, uint64_t x1, cons
 }
 
 // The runs common to both stretches found by identity, in the order they sit in `b`, disjoint there.
-template<Shape S> void Runs(const Trie<S> &a, uint64_t x0, uint64_t x1, const Trie<S> &b, uint64_t y0, uint64_t y1, std::vector<Anchor> &found) {
+template<typename V> void Runs(const V &a, uint64_t x0, uint64_t x1, const V &b, uint64_t y0, uint64_t y1, std::vector<Anchor> &found) {
     // Sized from the length rather than a count of chunks, so the table size does not depend on how the stretch is cut.
     Table table((x1 - x0) / Slots + 2);
 
@@ -853,7 +892,7 @@ template<Shape S> void Runs(const Trie<S> &a, uint64_t x0, uint64_t x1, const Tr
     }
 }
 
-template<Shape S> void Copy(const Trie<S> &v, uint64_t from, uint64_t to, uint64_t *out) {
+template<typename V> void Copy(const V &v, uint64_t from, uint64_t to, uint64_t *out) {
     for (auto c = SeekTo(v, from); from < to; Advance(v, c)) {
         const auto offset = from - c.Base, count = std::min(uint64_t{c.Count} - offset, to - from);
         std::memcpy(out, c.Values + offset, count * sizeof(uint64_t));
@@ -862,11 +901,11 @@ template<Shape S> void Copy(const Trie<S> &v, uint64_t from, uint64_t to, uint64
     }
 }
 
-template<Shape S> struct Reader {
-    const Trie<S> &Vec;
+template<typename V> struct Reader {
+    const V &Vec;
     Cursor Cur;
     uint64_t At;
-    Reader(const Trie<S> &v, uint64_t at) : Vec(v), Cur(SeekTo(v, at)), At(at) {}
+    Reader(const V &v, uint64_t at) : Vec(v), Cur(SeekTo(v, at)), At(at) {}
     uint64_t Next() {
         if (At == Cur.Base + Cur.Count) Advance(Vec, Cur);
         return Cur.Values[At++ - Cur.Base];
@@ -886,7 +925,7 @@ uint64_t Mixed(uint64_t v) { return (v ^ (v >> 31)) * 0xBF58476D1CE4E5B9; }
 
 // Adds the runs found by content to those found by identity, still disjoint in `b`.
 // Two runs may overlap in `a`, which `Chain` allows.
-template<Shape S> void Blocks(const Trie<S> &a, uint64_t x0, uint64_t x1, const Trie<S> &b, uint64_t y0, uint64_t y1, std::vector<Anchor> &found) {
+template<typename V> void Blocks(const V &a, uint64_t x0, uint64_t x1, const V &b, uint64_t y0, uint64_t y1, std::vector<Anchor> &found) {
     if (x1 - x0 < Window || y1 - y0 < Window) return;
     const auto count = found.size(); // The runs identity found, indexed rather than pointed to, since `push_back` may move them.
 
@@ -1041,7 +1080,7 @@ void Tally(uint32_t which) { ++Settled[which]; }
 void Tally(uint32_t) {}
 #endif
 
-template<Shape S> void DiffRange(const Trie<S> &a, uint64_t x0, uint64_t x1, const Trie<S> &b, uint64_t y0, uint64_t y1, Sink &sink);
+template<typename V> void DiffRange(const V &a, uint64_t x0, uint64_t x1, const V &b, uint64_t y0, uint64_t y1, Sink &sink);
 
 uint64_t Agree(const uint64_t *a, const uint64_t *b, uint64_t limit) {
     uint64_t k = 0;
@@ -1089,7 +1128,7 @@ bool FlatRange(const uint64_t *A, int64_t x0, int64_t x1, const uint64_t *B, int
 
 // Aligns the stretch on the runs common to both and diffs each gap between them.
 // Returns false without reporting anything when there are none.
-template<Shape S> bool Anchored(const Trie<S> &a, uint64_t x0, uint64_t x1, const Trie<S> &b, uint64_t y0, uint64_t y1, Sink &sink) {
+template<typename V> bool Anchored(const V &a, uint64_t x0, uint64_t x1, const V &b, uint64_t y0, uint64_t y1, Sink &sink) {
     std::vector<Anchor> found;
     Runs(a, x0, x1, b, y0, y1, found);
     auto by = ByRun;
@@ -1117,7 +1156,7 @@ template<Shape S> bool Anchored(const Trie<S> &a, uint64_t x0, uint64_t x1, cons
     return true;
 }
 
-template<Shape S> void DiffRange(const Trie<S> &a, uint64_t x0, uint64_t x1, const Trie<S> &b, uint64_t y0, uint64_t y1, Sink &sink) {
+template<typename V> void DiffRange(const V &a, uint64_t x0, uint64_t x1, const V &b, uint64_t y0, uint64_t y1, Sink &sink) {
     // The common prefix and suffix, which are the whole answer for two vectors related by one write, append, cut, or splice.
     const auto pre = Extend(a, x0, b, y0, std::min(x1 - x0, y1 - y0));
     x0 += pre;
@@ -1168,19 +1207,25 @@ template<Shape S> void DiffRange(const Trie<S> &a, uint64_t x0, uint64_t x1, con
 
 // How many elements sit under `n`, or zero for a node that breaks the invariant -- which no well formed
 // node returns, every node standing over at least one element.
-template<Shape S> uint64_t CheckNode(const Node *n, uint32_t shift) {
+template<Shape S, typename W> uint64_t CheckNode(const Node *n, uint32_t shift) {
     if (!n->Count || n->Count > Slots) return 0;
     if (!shift) return n->Count;
     const auto *sizes = n->Sizes;
     if (sizes && (!Relaxed(S) || sizes->Count != n->Count)) return 0; // A strict node carries no table.
-    uint64_t total = 0;
+    const auto *weights = n->Weights;
+    if (HasWeight<W> && (!weights || weights->Count != n->Count)) return 0;
+    uint64_t total = 0, weight = 0;
     bool strict = true;
     for (uint32_t i = 0, nc = n->Count; i < nc; ++i) {
-        const auto under = CheckNode<S>(Children(n)[i], shift - Bits);
+        const auto under = CheckNode<S, W>(Children(n)[i], shift - Bits);
         if (!under) return 0;
         total += under;
         if (sizes && Values(sizes)[i] != total) return 0;
         if (i + 1 < nc && under != uint64_t{1} << shift) strict = false;
+        if constexpr (HasWeight<W>) {
+            weight += SubtreeWeight<W>(Children(n)[i], shift - Bits);
+            if (Values(weights)[i] != weight) return 0;
+        }
     }
     // A table exactly where one is needed, and nowhere else.
     return strict == !sizes ? total : 0;
@@ -1199,7 +1244,7 @@ void Descend(Iterator &it, const Node *n) {
 
 // Everything let go of, field by field rather than by assignment: what the vector was standing on has
 // been released already, and assigning would hand it to a temporary that releases it again.
-template<Shape S> void Clear(Trie<S> &v) {
+template<typename V> void Clear(V &v) {
     if (v.Root) Release(v.Root, v.Shift);
     if (v.Tail) Release(v.Tail, 0);
     v.Root = v.Tail = nullptr;
@@ -1210,7 +1255,7 @@ template<Shape S> void Clear(Trie<S> &v) {
 // Everything an append does beyond storing into the tail: a fresh tail when there is none or the one
 // there is has to be copied, and the trie when the tail has filled. Out of line, and so out of the
 // caller, since one push in a chunk's worth reaches it and the caller has to stay small.
-template<Shape S> [[gnu::noinline]] void PushBackSlow(Trie<S> &v, uint64_t value) {
+template<Shape S, typename W> [[gnu::noinline]] void PushBackSlow(Trie<S, W> &v, uint64_t value) {
     const auto tc = v.Tail ? v.Tail->Count : 0;
     if (tc < Slots) { // A tail that is shared, or not there at all.
         auto *tail = tc ? CopiedLeaf(v.Tail, tc + 1) : Alloc(1);
@@ -1227,10 +1272,10 @@ template<Shape S> [[gnu::noinline]] void PushBackSlow(Trie<S> &v, uint64_t value
     v.Tail = tail;
     const auto told = v.Size - Slots; // What the trie holds before the chunk goes in.
     ++v.Size;
-    PushChunk<S>(v.Root, v.Shift, leaf, told);
+    PushChunk<S, W>(v.Root, v.Shift, leaf, told);
 }
 
-template<Shape S> void PushBackMut(Trie<S> &v, uint64_t value) {
+template<Shape S, typename W> void PushBackMut(Trie<S, W> &v, uint64_t value) {
     // A tail this vector alone holds grows in place, every node having room for a full chunk. That is
     // the whole of a push onto a vector being given up: one store, one count, one size.
     const auto tc = v.Tail ? v.Tail->Count : 0;
@@ -1242,7 +1287,7 @@ template<Shape S> void PushBackMut(Trie<S> &v, uint64_t value) {
 
 // The whole of a write to an index the vector already holds. Nothing from here down knows whether the
 // caller brought a value or a function of the one being displaced.
-template<Shape S, typename F> void SetWith(Trie<S> &v, uint64_t index, F value) {
+template<Shape S, typename W, typename F> void SetWith(Trie<S, W> &v, uint64_t index, F value) {
     const auto told = TailOffset(v);
     if (index >= told) {
         const auto slot = uint32_t(index - told);
@@ -1257,20 +1302,20 @@ template<Shape S, typename F> void SetWith(Trie<S> &v, uint64_t index, F value) 
         v.Tail = tail;
         return;
     }
-    const auto *root = SetAt<S>(v.Root, index, value, v.Shift, v.Root->Refs == 1);
+    const auto *root = SetAt<S, W>(v.Root, index, value, v.Shift, v.Root->Refs == 1);
     if (root == v.Root) return; // Written in place, so the vector already stands on the answer.
     Release(v.Root, v.Shift);
     v.Root = root;
 }
 
-template<Shape S> void SetMut(Trie<S> &v, uint64_t index, uint64_t value) {
+template<Shape S, typename W> void SetMut(Trie<S, W> &v, uint64_t index, uint64_t value) {
     SetWith(v, index, [value](uint64_t) { return value; });
 }
-template<Shape S> void UpdateMut(Trie<S> &v, uint64_t index, uint64_t (*fn)(void *, uint64_t), void *context) {
+template<Shape S, typename W> void UpdateMut(Trie<S, W> &v, uint64_t index, uint64_t (*fn)(void *, uint64_t), void *context) {
     SetWith(v, index, [fn, context](uint64_t current) { return fn(context, current); });
 }
 
-template<Shape S> void TakeMut(Trie<S> &v, uint64_t count) {
+template<Shape S, typename W> void TakeMut(Trie<S, W> &v, uint64_t count) {
     if (count >= v.Size) return;
     if (!count) return Clear(v);
     const auto told = TailOffset(v);
@@ -1287,7 +1332,7 @@ template<Shape S> void TakeMut(Trie<S> &v, uint64_t count) {
         return;
     }
     const Node *tail = nullptr;
-    const auto *root = Cut<S>(v.Root, count, v.Shift, tail);
+    const auto *root = Cut<S, W>(v.Root, count, v.Shift, tail);
     auto shift = v.Shift;
     if (root) Collapse(root, shift);
     Release(v.Root, v.Shift);
@@ -1298,7 +1343,7 @@ template<Shape S> void TakeMut(Trie<S> &v, uint64_t count) {
     v.Shift = root ? shift : 0;
 }
 
-void DropMut(FlexVector &v, uint64_t count) {
+template<typename W> void DropMut(Flex<W> &v, uint64_t count) {
     if (!count) return;
     if (count >= v.Size) return Clear(v);
     const auto told = TailOffset(v);
@@ -1314,7 +1359,7 @@ void DropMut(FlexVector &v, uint64_t count) {
         v.Shift = 0;
         return;
     }
-    const auto *root = Dropped(v.Root, count, v.Shift);
+    const auto *root = Dropped<W>(v.Root, count, v.Shift);
     auto shift = v.Shift;
     Collapse(root, shift);
     Release(v.Root, v.Shift);
@@ -1324,22 +1369,23 @@ void DropMut(FlexVector &v, uint64_t count) {
 }
 } // namespace
 
-template<Shape S> Trie<S>::Trie(const Trie &o) : Trie(o.Root, o.Tail, o.Size, o.Shift) { Claim(*this); }
-template<Shape S>
-Trie<S>::Trie(const Trie<Shape::Strict> &o)
-    requires(S == Shape::Relaxed)
+template<Shape S, typename W> Trie<S, W>::Trie(const Trie &o) : Trie(o.Root, o.Tail, o.Size, o.Shift) { Claim(*this); }
+template<Shape S, typename W>
+template<Shape O, typename N>
+Trie<S, W>::Trie(const Trie<O, N> &o)
+    requires Widens<S, W, O, N>
     : Trie(o.Root, o.Tail, o.Size, o.Shift) {
     Claim(*this);
 }
 // Default-initialized to empty by the member initializers, then handed `o`'s contents, leaving `o` empty
 // rather than a vector whose size no longer matches the nodes it gave up.
-template<Shape S> Trie<S>::Trie(Trie &&o) noexcept { Swap(*this, o); }
-template<Shape S> Trie<S>::~Trie() {
+template<Shape S, typename W> Trie<S, W>::Trie(Trie &&o) noexcept { Swap(*this, o); }
+template<Shape S, typename W> Trie<S, W>::~Trie() {
     if (Root) Release(Root, Shift);
     if (Tail) Release(Tail, 0);
 }
-template<Shape S> Trie<S> &Trie<S>::operator=(const Trie &o) { return *this = Trie{o}; }
-template<Shape S> Trie<S> &Trie<S>::operator=(Trie &&o) noexcept {
+template<Shape S, typename W> Trie<S, W> &Trie<S, W>::operator=(const Trie &o) { return *this = Trie{o}; }
+template<Shape S, typename W> Trie<S, W> &Trie<S, W>::operator=(Trie &&o) noexcept {
     // A write handed an rvalue gives back the same vector, so `v = PushBack(std::move(v), x)` assigns
     // from itself, and the check against self keeps that free.
     if (this != &o) Swap(*this, o);
@@ -1351,7 +1397,7 @@ template<Shape S> Trie<S> &Trie<S>::operator=(Trie &&o) noexcept {
 // stays where it is and a slot never waits on the slot above it. Behind a call that leaves the index
 // somewhere a node load could have written, the descent reloads it a level at a time and a random index
 // costs a third again as much.
-template<Shape S> const uint64_t &Trie<S>::operator[](uint64_t index) const {
+template<Shape S, typename W> const uint64_t &Trie<S, W>::operator[](uint64_t index) const {
     const auto told = TailOffset(*this);
     if (index >= told) return Values(Tail)[index - told];
     if constexpr (Relaxed(S)) {
@@ -1366,53 +1412,53 @@ template<Shape S> const uint64_t &Trie<S>::operator[](uint64_t index) const {
 // The two forms of every write, over one implementation. The form that has to leave its argument alone
 // retains it first: every node under it is then held twice, so the write copies. Same rule as everywhere
 // else here, reached by holding the vector rather than by a flag.
-template<Shape S> Trie<S> PushBack(const Trie<S> &v, uint64_t value) {
-    Trie<S> out{v};
+template<Shape S, typename W> Trie<S, W> PushBack(const Trie<S, W> &v, uint64_t value) {
+    Trie<S, W> out{v};
     PushBackMut(out, value);
     return out;
 }
-template<Shape S> Trie<S> &&PushBack(Trie<S> &&v, uint64_t value) {
+template<Shape S, typename W> Trie<S, W> &&PushBack(Trie<S, W> &&v, uint64_t value) {
     PushBackMut(v, value);
     return std::move(v);
 }
-template<Shape S> Trie<S> Set(const Trie<S> &v, uint64_t index, uint64_t value) {
-    Trie<S> out{v};
+template<Shape S, typename W> Trie<S, W> Set(const Trie<S, W> &v, uint64_t index, uint64_t value) {
+    Trie<S, W> out{v};
     SetMut(out, index, value);
     return out;
 }
-template<Shape S> Trie<S> &&Set(Trie<S> &&v, uint64_t index, uint64_t value) {
+template<Shape S, typename W> Trie<S, W> &&Set(Trie<S, W> &&v, uint64_t index, uint64_t value) {
     SetMut(v, index, value);
     return std::move(v);
 }
-template<Shape S> Trie<S> Update(const Trie<S> &v, uint64_t index, uint64_t (*fn)(void *, uint64_t), void *context) {
-    Trie<S> out{v};
+template<Shape S, typename W> Trie<S, W> Update(const Trie<S, W> &v, uint64_t index, uint64_t (*fn)(void *, uint64_t), void *context) {
+    Trie<S, W> out{v};
     UpdateMut(out, index, fn, context);
     return out;
 }
-template<Shape S> Trie<S> &&Update(Trie<S> &&v, uint64_t index, uint64_t (*fn)(void *, uint64_t), void *context) {
+template<Shape S, typename W> Trie<S, W> &&Update(Trie<S, W> &&v, uint64_t index, uint64_t (*fn)(void *, uint64_t), void *context) {
     UpdateMut(v, index, fn, context);
     return std::move(v);
 }
-template<Shape S> Trie<S> Take(const Trie<S> &v, uint64_t count) {
-    Trie<S> out{v};
+template<Shape S, typename W> Trie<S, W> Take(const Trie<S, W> &v, uint64_t count) {
+    Trie<S, W> out{v};
     TakeMut(out, count);
     return out;
 }
-template<Shape S> Trie<S> &&Take(Trie<S> &&v, uint64_t count) {
+template<Shape S, typename W> Trie<S, W> &&Take(Trie<S, W> &&v, uint64_t count) {
     TakeMut(v, count);
     return std::move(v);
 }
-FlexVector Drop(const FlexVector &v, uint64_t count) {
-    FlexVector out{v};
+template<typename W> Flex<W> Drop(const Flex<W> &v, uint64_t count) {
+    Flex<W> out{v};
     DropMut(out, count);
     return out;
 }
-FlexVector &&Drop(FlexVector &&v, uint64_t count) {
+template<typename W> Flex<W> &&Drop(Flex<W> &&v, uint64_t count) {
     DropMut(v, count);
     return std::move(v);
 }
 
-FlexVector Concat(const FlexVector &a, const FlexVector &b) {
+template<typename W> Flex<W> Concat(const Flex<W> &a, const Flex<W> &b) {
     if (!a.Size) return b;
     if (!b.Size) return a;
     // Nothing but a tail on the right, and room for it, so the two tails become one and neither trie
@@ -1426,11 +1472,11 @@ FlexVector Concat(const FlexVector &a, const FlexVector &b) {
     // The join is trie to trie, so the left tail goes into the left trie first. The right tail stays
     // where it is and becomes the answer's.
     uint32_t shift;
-    const auto *root = Flattened(a, shift);
+    const auto *root = Flattened<W>(a, shift);
     Retain(b.Tail);
     if (!b.Root) return {root, b.Tail, a.Size + b.Size, shift};
 
-    const auto *top = Joined(root, shift, b.Root, b.Shift);
+    const auto *top = Joined<W>(root, shift, b.Root, b.Shift);
     const auto taller = shift > b.Shift ? shift : b.Shift;
     Release(root, shift);
     root = top;
@@ -1439,21 +1485,21 @@ FlexVector Concat(const FlexVector &a, const FlexVector &b) {
     return {root, b.Tail, a.Size + b.Size, shift};
 }
 
-FlexVector PushFront(const FlexVector &v, uint64_t value) {
+template<typename W> Flex<W> PushFront(const Flex<W> &v, uint64_t value) {
     auto *leaf = Alloc(1);
     Values(leaf)[0] = value;
-    return Concat(FlexVector{nullptr, leaf, 1, 0}, v);
+    return Concat(Flex<W>{nullptr, leaf, 1, 0}, v);
 }
 
-FlexVector Insert(const FlexVector &v, uint64_t pos, uint64_t value) { return Concat(PushBack(Take(v, pos), value), Drop(v, pos)); }
-FlexVector Insert(const FlexVector &v, uint64_t pos, const FlexVector &values) { return Concat(Concat(Take(v, pos), values), Drop(v, pos)); }
-FlexVector Erase(const FlexVector &v, uint64_t pos) { return Erase(v, pos, pos + 1); }
-FlexVector Erase(const FlexVector &v, uint64_t first, uint64_t last) {
+template<typename W> Flex<W> Insert(const Flex<W> &v, uint64_t pos, uint64_t value) { return Concat(PushBack(Take(v, pos), value), Drop(v, pos)); }
+template<typename W> Flex<W> Insert(const Flex<W> &v, uint64_t pos, const Flex<W> &values) { return Concat(Concat(Take(v, pos), values), Drop(v, pos)); }
+template<typename W> Flex<W> Erase(const Flex<W> &v, uint64_t pos) { return Erase(v, pos, pos + 1); }
+template<typename W> Flex<W> Erase(const Flex<W> &v, uint64_t first, uint64_t last) {
     if (first >= last) return v;
     return Concat(Take(v, first), Drop(v, last));
 }
 
-template<Shape S> Trie<S> Build(const uint64_t *first, const uint64_t *last) {
+template<Shape S, typename W> Trie<S, W> Build(const uint64_t *first, const uint64_t *last) {
     const auto n = uint64_t(last - first);
     if (!n) return {};
     const auto told = (n - 1) & ~Mask;
@@ -1477,6 +1523,7 @@ template<Shape S> Trie<S> Build(const uint64_t *first, const uint64_t *last) {
             const auto from = p << Bits, to = from + Slots < count ? from + Slots : count;
             auto *inner = AllocInner(uint32_t(to - from));
             std::memcpy(static_cast<void *>(Children(inner)), static_cast<const void *>(nodes + from), (to - from) * sizeof(const Node *));
+            MeasureWeights<W>(inner, shift + Bits);
             nodes[p] = inner;
         }
         count = parents;
@@ -1486,7 +1533,7 @@ template<Shape S> Trie<S> Build(const uint64_t *first, const uint64_t *last) {
     return {root, tail, n, shift};
 }
 
-template<Shape S> void ForEachChunk(const Trie<S> &v, void (*visit)(void *, const uint64_t *, const uint64_t *), void *context) {
+template<Shape S, typename W> void ForEachChunk(const Trie<S, W> &v, void (*visit)(void *, const uint64_t *, const uint64_t *), void *context) {
     if (!v.Size) return; // An empty vector has no tail, and so calls nothing.
     if (v.Root && !v.Shift) {
         visit(context, Values(v.Root), Values(v.Root) + v.Root->Count);
@@ -1519,7 +1566,7 @@ template<Shape S> void ForEachChunk(const Trie<S> &v, void (*visit)(void *, cons
     visit(context, Values(v.Tail), Values(v.Tail) + v.Tail->Count);
 }
 
-template<Shape S> bool operator==(const Trie<S> &a, const Trie<S> &b) {
+template<Shape S, typename W> bool operator==(const Trie<S, W> &a, const Trie<S, W> &b) {
     if (a.Size != b.Size) return false;
     if (!a.Size) return true;
     if (a.Root == b.Root && a.Tail == b.Tail) return true;
@@ -1541,15 +1588,15 @@ template<Shape S> bool operator==(const Trie<S> &a, const Trie<S> &b) {
     }
 }
 
-template<Shape S> void Diff(const Trie<S> &a, const Trie<S> &b, void (*report)(void *, const Change &), void *context) {
+template<Shape S, typename W> void Diff(const Trie<S, W> &a, const Trie<S, W> &b, void (*report)(void *, const Change &), void *context) {
     Sink sink{report, context};
     // An empty stretch is never read, so an empty vector's null tail is never sought.
     DiffRange(a, 0, a.Size, b, 0, b.Size, sink);
     sink.Flush();
 }
 
-FlexVector Apply(const FlexVector &a, const Change *first, const Change *last, const FlexVector &source) {
-    FlexVector out;
+template<typename W> Flex<W> Apply(const Flex<W> &a, const Change *first, const Change *last, const Flex<W> &source) {
+    Flex<W> out;
     uint64_t at = 0; // How far into `a` the runs so far reach.
     for (const auto *c = first; c != last; ++c) {
         // Each piece is two cuts and a join, logarithmic, and shares every subtrie it does not straddle.
@@ -1560,7 +1607,49 @@ FlexVector Apply(const FlexVector &a, const Change *first, const Change *last, c
     return Concat(out, Drop(a, at));
 }
 
-template<Shape S> bool Check(const Trie<S> &v) {
+template<Shape S, typename W> uint64_t Seek(const Trie<S, W> &v, uint64_t k) {
+    uint64_t base = 0;
+    const auto *n = v.Tail;
+    const auto under = v.Root ? SubtreeWeight<W>(v.Root, v.Shift) : 0;
+    if (k < under) {
+        n = v.Root;
+        for (auto shift = v.Shift; shift; shift -= Bits) {
+            const auto *totals = Values(n->Weights);
+            uint32_t i = 0;
+            while (totals[i] <= k) ++i;
+            if (i) k -= totals[i - 1];
+            base += SlotOffset(n, i, shift);
+            n = Children(n)[i];
+        }
+    } else {
+        k -= under;
+        base = TailOffset(v);
+    }
+    const auto *vals = Values(n);
+    for (uint32_t i = 0;; ++i) {
+        const auto w = W::Of(vals[i]);
+        if (w > k) return base + i;
+        k -= w;
+    }
+}
+
+template<Shape S, typename W> uint64_t WeightBefore(const Trie<S, W> &v, uint64_t index) {
+    if (!v.Size) return 0;
+    const auto told = TailOffset(v);
+    if (index >= told) return (v.Root ? SubtreeWeight<W>(v.Root, v.Shift) : 0) + LeafWeight<W>(v.Tail, index - told);
+    uint64_t weight = 0, within = index;
+    const auto *n = v.Root;
+    for (auto shift = v.Shift; shift; shift -= Bits) {
+        const auto i = Slot<S>(n, within, shift);
+        if (i) weight += Values(n->Weights)[i - 1];
+        n = Children(n)[i];
+    }
+    return weight + LeafWeight<W>(n, within);
+}
+
+template<Shape S, typename W> uint64_t Weight(const Trie<S, W> &v) { return WeightBefore(v, v.Size); }
+
+template<Shape S, typename W> bool Check(const Trie<S, W> &v) {
     if (!v.Size) return !v.Root && !v.Tail && v.Shift == 0;
     if (!v.Tail || !v.Tail->Count || v.Tail->Count > Slots) return false;
     const auto told = v.Size - v.Tail->Count;
@@ -1569,7 +1658,7 @@ template<Shape S> bool Check(const Trie<S> &v) {
     if (!told) return !v.Root && v.Shift == 0;
     if (!v.Root || v.Shift % Bits || v.Shift >= 64) return false; // The root stands on a level boundary.
     if (v.Shift && v.Root->Count < 2) return false; // And no higher than it has to.
-    return CheckNode<S>(v.Root, v.Shift) == told;
+    return CheckNode<S, W>(v.Root, v.Shift) == told;
 }
 
 std::optional<Phases> DiffPhases() {
@@ -1622,7 +1711,7 @@ void Iterator::Advance() {
     Cur = End = nullptr;
 }
 
-template<Shape S> Iterator begin(const Trie<S> &v) {
+template<Shape S, typename W> Iterator begin(const Trie<S, W> &v) {
     Iterator it{v}; // The copy is the reference that holds the structure below still.
     if (!v.Size) return it;
     it.Rest = v.Tail;
@@ -1631,36 +1720,44 @@ template<Shape S> Iterator begin(const Trie<S> &v) {
     return it;
 }
 
-// Both shapes are compiled here and nowhere else: a header that offered them would have to offer the
-// node, and the node is this file's own.
-template struct Trie<Shape::Strict>;
-template struct Trie<Shape::Relaxed>;
-template Vector Build(const uint64_t *, const uint64_t *);
-template FlexVector Build(const uint64_t *, const uint64_t *);
-template Vector PushBack(const Vector &, uint64_t);
-template FlexVector PushBack(const FlexVector &, uint64_t);
-template Vector &&PushBack(Vector &&, uint64_t);
-template FlexVector &&PushBack(FlexVector &&, uint64_t);
-template Vector Set(const Vector &, uint64_t, uint64_t);
-template FlexVector Set(const FlexVector &, uint64_t, uint64_t);
-template Vector &&Set(Vector &&, uint64_t, uint64_t);
-template FlexVector &&Set(FlexVector &&, uint64_t, uint64_t);
-template Vector Update(const Vector &, uint64_t, uint64_t (*)(void *, uint64_t), void *);
-template FlexVector Update(const FlexVector &, uint64_t, uint64_t (*)(void *, uint64_t), void *);
-template Vector &&Update(Vector &&, uint64_t, uint64_t (*)(void *, uint64_t), void *);
-template FlexVector &&Update(FlexVector &&, uint64_t, uint64_t (*)(void *, uint64_t), void *);
-template Vector Take(const Vector &, uint64_t);
-template FlexVector Take(const FlexVector &, uint64_t);
-template Vector &&Take(Vector &&, uint64_t);
-template FlexVector &&Take(FlexVector &&, uint64_t);
-template void ForEachChunk(const Vector &, void (*)(void *, const uint64_t *, const uint64_t *), void *);
-template void ForEachChunk(const FlexVector &, void (*)(void *, const uint64_t *, const uint64_t *), void *);
-template bool operator==(const Vector &, const Vector &);
-template bool operator==(const FlexVector &, const FlexVector &);
-template void Diff(const Vector &, const Vector &, void (*)(void *, const Change &), void *);
-template void Diff(const FlexVector &, const FlexVector &, void (*)(void *, const Change &), void *);
-template bool Check(const Vector &);
-template bool Check(const FlexVector &);
-template Iterator begin(const Vector &);
-template Iterator begin(const FlexVector &);
+// Every shape and weight is compiled here and nowhere else: a header that offered them would have to
+// offer the node, and the node is this file's own.
+#define PERSISTENT_VECTOR_INSTANTIATE(V, W)                                                                       \
+    template struct Trie<V, W>;                                                                                   \
+    template Trie<V, W> Build(const uint64_t *, const uint64_t *);                                                \
+    template Trie<V, W> PushBack(const Trie<V, W> &, uint64_t);                                                   \
+    template Trie<V, W> &&PushBack(Trie<V, W> &&, uint64_t);                                                      \
+    template Trie<V, W> Set(const Trie<V, W> &, uint64_t, uint64_t);                                              \
+    template Trie<V, W> &&Set(Trie<V, W> &&, uint64_t, uint64_t);                                                 \
+    template Trie<V, W> Update(const Trie<V, W> &, uint64_t, uint64_t (*)(void *, uint64_t), void *);             \
+    template Trie<V, W> &&Update(Trie<V, W> &&, uint64_t, uint64_t (*)(void *, uint64_t), void *);                \
+    template Trie<V, W> Take(const Trie<V, W> &, uint64_t);                                                       \
+    template Trie<V, W> &&Take(Trie<V, W> &&, uint64_t);                                                          \
+    template void ForEachChunk(const Trie<V, W> &, void (*)(void *, const uint64_t *, const uint64_t *), void *); \
+    template bool operator==(const Trie<V, W> &, const Trie<V, W> &);                                             \
+    template void Diff(const Trie<V, W> &, const Trie<V, W> &, void (*)(void *, const Change &), void *);         \
+    template bool Check(const Trie<V, W> &);                                                                      \
+    template Iterator begin(const Trie<V, W> &);
+#define PERSISTENT_FLEX_INSTANTIATE(W)                                   \
+    template Flex<W> Drop(const Flex<W> &, uint64_t);                    \
+    template Flex<W> &&Drop(Flex<W> &&, uint64_t);                       \
+    template Flex<W> Concat(const Flex<W> &, const Flex<W> &);           \
+    template Flex<W> PushFront(const Flex<W> &, uint64_t);               \
+    template Flex<W> Insert(const Flex<W> &, uint64_t, uint64_t);        \
+    template Flex<W> Insert(const Flex<W> &, uint64_t, const Flex<W> &); \
+    template Flex<W> Erase(const Flex<W> &, uint64_t);                   \
+    template Flex<W> Erase(const Flex<W> &, uint64_t, uint64_t);         \
+    template Flex<W> Apply(const Flex<W> &, const Change *, const Change *, const Flex<W> &);
+PERSISTENT_VECTOR_INSTANTIATE(Shape::Strict, Unweighted)
+PERSISTENT_VECTOR_INSTANTIATE(Shape::Relaxed, Unweighted)
+PERSISTENT_VECTOR_INSTANTIATE(Shape::Relaxed, Mark<VECTOR_WEIGHT_KEY>)
+PERSISTENT_FLEX_INSTANTIATE(Unweighted)
+PERSISTENT_FLEX_INSTANTIATE(Mark<VECTOR_WEIGHT_KEY>)
+#undef PERSISTENT_VECTOR_INSTANTIATE
+#undef PERSISTENT_FLEX_INSTANTIATE
+template FlexVector::Trie(const Vector &);
+template FlexVector::Trie(const Weighted &);
+template uint64_t Weight(const Weighted &);
+template uint64_t WeightBefore(const Weighted &, uint64_t);
+template uint64_t Seek(const Weighted &, uint64_t);
 } // namespace vec
